@@ -1,0 +1,10 @@
+{
+  "name": "qqbot",
+  "version": "0.1.0",
+  "description": "Akashic QQBot channel plugin",
+  "akashic": {
+    "lifecycle": {
+      "entry": "plugin.py"
+    }
+  }
+}
