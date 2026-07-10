@@ -92,6 +92,8 @@ class QQBotChannel:
         self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
 
     async def start(self, ctx: ChannelContext) -> None:
+        if self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=30.0)
         self._bus = ctx.bus
         self._interrupt_controller = ctx.interrupt_controller
         if not self._events_bound:
@@ -118,8 +120,11 @@ class QQBotChannel:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
         await self._drain_live_tasks()
         await self._client.aclose()
+        self._events_bound = False
+        self._outbound_bound = False
         logger.info("[qqbot] 官方 QQBot 通道已停止")
 
     def _require_bus(self) -> MessageBus:
