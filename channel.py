@@ -148,36 +148,41 @@ class QQBotChannel:
     async def _run_gateway(self, url: str, token: str) -> None:
         last_seq: int | None = None
         heartbeat_task: asyncio.Task[None] | None = None
-        async with websockets.connect(url) as ws:
-            async for raw in ws:
-                payload = json.loads(raw)
-                op = payload.get("op")
-                raw_data = payload.get("d")
-                data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
-                event_type = payload.get("t")
-                if isinstance(payload.get("s"), int):
-                    last_seq = int(payload["s"])
+        try:
+            async with websockets.connect(url) as ws:
+                async for raw in ws:
+                    payload = json.loads(raw)
+                    op = payload.get("op")
+                    raw_data = payload.get("d")
+                    data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
+                    event_type = payload.get("t")
+                    if isinstance(payload.get("s"), int):
+                        last_seq = int(payload["s"])
 
-                if op == 10:
-                    heartbeat_ms = int(data["heartbeat_interval"])
-                    await ws.send(json.dumps({
-                        "op": 2,
-                        "d": {
-                            "token": f"QQBot {token}",
-                            "intents": self._intents(),
-                            "shard": [0, 1],
-                        },
-                    }))
-                    heartbeat_task = asyncio.create_task(
-                        self._heartbeat(ws, heartbeat_ms, lambda: last_seq)
-                    )
-                elif op == 0:
-                    await self._handle_dispatch(str(event_type), data)
-                elif op == 7:
-                    break
-
-        if heartbeat_task:
-            _ = heartbeat_task.cancel()
+                    if op == 10:
+                        heartbeat_ms = int(data["heartbeat_interval"])
+                        await ws.send(json.dumps({
+                            "op": 2,
+                            "d": {
+                                "token": f"QQBot {token}",
+                                "intents": self._intents(),
+                                "shard": [0, 1],
+                            },
+                        }))
+                        if heartbeat_task is not None:
+                            _ = heartbeat_task.cancel()
+                            await asyncio.gather(heartbeat_task, return_exceptions=True)
+                        heartbeat_task = asyncio.create_task(
+                            self._heartbeat(ws, heartbeat_ms, lambda: last_seq)
+                        )
+                    elif op == 0:
+                        await self._handle_dispatch(str(event_type), data)
+                    elif op == 7:
+                        break
+        finally:
+            if heartbeat_task is not None:
+                _ = heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     async def _heartbeat(
         self,
