@@ -58,6 +58,7 @@ class QQBotConfigModel(BaseModel):
 
 
 class QQBotPlugin(Plugin):
+    api_version = 2
     name = "qqbot"
     version = "1.0.0"
     desc = "官方 QQBot 渠道"
