@@ -9,6 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.tools.message_push import MessagePushTool
+from bus.events import (
+    AttachmentKind,
+    ChannelAttachment,
+    ChannelMessage,
+    DeliveryStatus,
+)
+
 
 def _load_plugin_module():
     path = Path(__file__).parents[1] / "plugin.py"
@@ -131,22 +139,55 @@ async def test_channel_can_start_stop_twice() -> None:
     channel._gateway_loop = gateway_loop
     registry = SimpleNamespace(
         on=lambda *_args: object(),
-        register_channel=lambda *_args, **_kwargs: object(),
         subscribe_outbound=lambda *_args: object(),
     )
+    push_tools = [MessagePushTool(), MessagePushTool()]
     context = SimpleNamespace(
         bus=registry,
         event_bus=registry,
-        push_tool=registry,
+        push_tool=push_tools[0],
         interrupt_controller=None,
     )
 
     await channel.start(context)
     await asyncio.sleep(0)
     await channel.stop()
+    context.push_tool = push_tools[1]
     await channel.start(context)
     await asyncio.sleep(0)
     await channel.stop()
 
     assert starts == 2
     assert channel._task is None
+    assert all("qqbot" in tool._adapters for tool in push_tools)
+
+
+@pytest.mark.asyncio
+async def test_delivery_adapter_reports_unsupported_attachment() -> None:
+    plugin = QQBotPlugin()
+    plugin.context = type(
+        "Ctx",
+        (),
+        {"config": QQBotConfigModel(app_id="app", client_secret="secret")},
+    )()
+    channel = plugin.channels()[0]
+    sent: list[tuple[str, str]] = []
+
+    async def send(chat_id: str, content: str) -> None:
+        sent.append((chat_id, content))
+
+    channel.send_proactive = send
+    receipt = await channel._deliver_message(
+        ChannelMessage(
+            channel="qqbot",
+            chat_id="c2c:user",
+            content="正文",
+            attachments=(
+                ChannelAttachment(AttachmentKind.FILE, "/tmp/a.txt", "a.txt"),
+            ),
+        )
+    )
+
+    assert receipt.status is DeliveryStatus.PARTIAL
+    assert receipt.detail == "官方 QQBot 当前不支持发送文件"
+    assert sent == [("c2c:user", "正文")]
