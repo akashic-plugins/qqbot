@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, cast
 
@@ -21,10 +21,17 @@ import httpx
 import websockets
 
 from agent.looping.interrupt import InterruptController
-from bus.events import InboundMessage, OutboundMessage
+from bus.events import (
+    ChannelMessage,
+    DeliveryReceipt,
+    InboundMessage,
+    OutboundMessage,
+    channel_message_from_outbound,
+)
 from bus.events_lifecycle import StreamDeltaReady, TurnStarted
 from bus.queue import MessageBus
 from infra.channels.contract import ChannelContext
+from infra.channels.delivery import deliver_message_parts
 
 if TYPE_CHECKING:
     from .plugin import QQBotGroupConfigModel
@@ -102,8 +109,7 @@ class QQBotChannel:
             self._events_bound = True
         ctx.push_tool.register_channel(
             self.name,
-            text=self.send_proactive,
-            stream_text=self.send_stream,
+            deliver=self._deliver_message,
         )
         self._stopped.clear()
         self._task = asyncio.create_task(self._gateway_loop())
@@ -261,8 +267,12 @@ class QQBotChannel:
             else:
                 await self._delete_live_preview(session_key)
             self._clear_live_session(session_key)
-        if content and not sent_as_stream:
-            await self.send(msg.chat_id, msg.content)
+        outbound = channel_message_from_outbound(msg)
+        if sent_as_stream:
+            outbound = replace(outbound, content="")
+        receipt = await self._deliver_message(outbound)
+        if not receipt.succeeded:
+            raise RuntimeError(receipt.detail or "QQBot 消息提交失败")
 
     async def send_proactive(self, chat_id: str, message: str) -> None:
         kind, _target = self._parse_chat_id(chat_id)
@@ -291,6 +301,26 @@ class QQBotChannel:
         except Exception as e:
             logger.warning("[qqbot] 私聊流式发送失败，回退普通发送: %s", e)
             await self.send(chat_id, message)
+
+    async def _deliver_message(self, message: ChannelMessage) -> DeliveryReceipt:
+        """提交 QQBot 文本消息，并明确拒绝未支持的附件。"""
+
+        async def unsupported_file(
+            _chat_id: str,
+            _path: str,
+            _name: str | None,
+        ) -> None:
+            raise RuntimeError("官方 QQBot 当前不支持发送文件")
+
+        async def unsupported_image(_chat_id: str, _path: str) -> None:
+            raise RuntimeError("官方 QQBot 当前不支持发送图片")
+
+        return await deliver_message_parts(
+            message,
+            send_text=self.send_proactive,
+            send_file=unsupported_file,
+            send_image=unsupported_image,
+        )
 
     async def _send_stream_c2c(self, openid: str, msg_id: str, message: str) -> None:
         token = await self._get_access_token()
