@@ -87,6 +87,7 @@ class QQBotAdapter:
 
     def __init__(self, context: ChannelFactoryContext) -> None:
         self._context = context
+        self._identity = context.identity
         self._ingress = context.ingress
         self._provider_factory = context.provider_client_factory
         self._credentials = context.credentials
@@ -100,11 +101,13 @@ class QQBotAdapter:
         self._client: httpx.AsyncClient | None = None
         self._token: _TokenCache | None = None
         self._gateway_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[StopReceipt] | None = None
         self._stopped = asyncio.Event()
         self._started = False
         self._stopping = False
 
         self._message_recipients: dict[str, str] = {}
+        self._message_identities: dict[str, str] = {}
         self._presentation_recipients: dict[str, str] = {}
         self._presentation_message_ids: dict[str, str] = {}
         self._reply_buffers: dict[str, str] = {}
@@ -133,30 +136,46 @@ class QQBotAdapter:
         if self._presentation is None:
             raise RuntimeError("QQBot adapter 缺少 presentation ports")
 
-        # 1. Validate both credential identities before acquiring any resource.
-        self._credential_ref("app_id")
-        self._credential_ref("client_secret")
+        try:
+            # 1. Validate both credential identities before acquiring any resource.
+            self._credential_ref("app_id")
+            self._credential_ref("client_secret")
 
-        # 2. Resolve only through the formal provider factory.
-        self._provider_client = await self._provider_factory.create(self._credentials)
-        self._client = httpx.AsyncClient(timeout=30.0)
+            # 2. Resolve only through the formal provider factory.
+            self._provider_client = await self._provider_factory.create(self._credentials)
+            self._client = httpx.AsyncClient(timeout=30.0)
 
-        # 3. Attach the exact presentation callback before receiving provider input.
-        turn_stream = self._presentation.turn_stream
-        if turn_stream is None:
-            raise RuntimeError("QQBot turn stream port 未绑定")
-        self._stream_subscription = turn_stream.subscribe(self._on_turn_stream)
-        self._stopped.clear()
-        self._gateway_task = asyncio.create_task(
-            self._gateway_loop(),
-            name=f"qqbot-gateway:{self._context.generation_id}",
-        )
-        self._started = True
-        return ChannelReady(
-            self._binding_token,
-            subscriptions=("qqbot.gateway", "qqbot.turn_stream"),
-            admission_open=False,
-        )
+            # 3. Attach the exact presentation callback before receiving provider input.
+            turn_stream = self._presentation.turn_stream
+            if turn_stream is None:
+                raise RuntimeError("QQBot turn stream port 未绑定")
+            self._stream_subscription = turn_stream.subscribe(self._on_turn_stream)
+            self._stopped.clear()
+            self._gateway_task = asyncio.create_task(
+                self._gateway_loop(),
+                name=f"qqbot-gateway:{self._context.generation_id}",
+            )
+            self._started = True
+            return ChannelReady(
+                self._binding_token,
+                subscriptions=("qqbot.gateway", "qqbot.turn_stream"),
+                admission_open=False,
+            )
+        except BaseException as error:
+            cleanup = await _await_task_after_cancellation(
+                asyncio.create_task(
+                    self._stop_impl(),
+                    name=f"qqbot-start-cleanup:{self._context.generation_id}",
+                )
+            )
+            if cleanup.failures:
+                error.add_note(
+                    "QQBot start cleanup failed: "
+                    + "; ".join(
+                        f"{item.resource}: {item.message}" for item in cleanup.failures
+                    )
+                )
+            raise
 
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
         """Send one text message and return a settled three-state receipt."""
@@ -204,6 +223,18 @@ class QQBotAdapter:
 
     async def stop(self) -> StopReceipt:
         """Close gateway, stream subscription, HTTP, and provider resources."""
+
+        task = self._stop_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._stop_impl(),
+                name=f"qqbot-stop:{self._context.generation_id}",
+            )
+            self._stop_task = task
+        return await _await_task_after_cancellation(task)
+
+    async def _stop_impl(self) -> StopReceipt:
+        """Close every owned resource and retain failed owners for retry."""
 
         self._stopping = True
         failures: list[ChannelCleanupFailure] = []
@@ -336,14 +367,14 @@ class QQBotAdapter:
         elif event_type.startswith("GROUP_"):
             logger.debug("[qqbot] 当前仅启用私聊模式，忽略群事件 event=%s", event_type)
 
-    async def _handle_c2c(self, data: dict[str, Any]) -> None:
+    async def _handle_c2c(self, data: dict[str, Any]) -> DeliveryStatus:
         if not isinstance(data, dict):
             logger.warning("[qqbot] 拒绝非 object 私聊 data")
-            return
+            return DeliveryStatus.REJECTED
         raw_author = data.get("author")
         if raw_author is not None and not isinstance(raw_author, dict):
             logger.warning("[qqbot] 拒绝非 object 私聊 author")
-            return
+            return DeliveryStatus.REJECTED
         author = raw_author if isinstance(raw_author, dict) else {}
         raw_openid = (
             author["user_openid"]
@@ -352,21 +383,24 @@ class QQBotAdapter:
         )
         if not isinstance(raw_openid, str):
             logger.warning("[qqbot] 拒绝非 string user_openid")
-            return
+            return DeliveryStatus.REJECTED
         openid = raw_openid.strip()
         raw_message_id = data.get("id")
         raw_content = data.get("content")
         if not isinstance(raw_message_id, str) or not isinstance(raw_content, str):
             logger.warning("[qqbot] 拒绝非 string identity/message/content")
-            return
+            return DeliveryStatus.REJECTED
         message_id = raw_message_id.strip()
         content = raw_content.strip()
         if not openid or not message_id or not content:
             logger.warning("[qqbot] 拒绝缺少 identity/message/content 的私聊事件")
-            return
+            return DeliveryStatus.REJECTED
         if not self._allow_from or openid not in self._allow_from:
             logger.warning("[qqbot] 拒绝未授权私聊用户 user_openid=%s", openid)
-            return
+            return DeliveryStatus.REJECTED
+        if _has_provider_attachments(data):
+            logger.info("[qqbot] 拒绝带附件的私聊事件 message_id=%s", message_id)
+            return DeliveryStatus.REJECTED
         raw = RawInbound(
             message_id=message_id,
             message=ChannelInboundMessage(
@@ -389,19 +423,24 @@ class QQBotAdapter:
             control = presentation.control
             if control is None:
                 raise RuntimeError("QQBot control port 未绑定")
-            await control.interrupt(
+            result = await control.interrupt(
                 raw,
                 response_bodies=ControlResponseBodies(
                     interrupted="已停止当前回复。",
                     idle="当前没有正在进行的回复。",
                 ),
             )
-            return
+            if result.response is None:
+                return DeliveryStatus.REJECTED
+            return result.response.status
         ingress = self._ingress
         if ingress is None:
             raise RuntimeError("QQBot ingress port 未绑定")
         if await ingress.admit(raw):
             self._message_recipients[message_id] = f"c2c:{openid}"
+            self._message_identities[message_id] = openid
+            return DeliveryStatus.DELIVERED
+        return DeliveryStatus.REJECTED
 
     async def _on_turn_stream(self, event: TurnStreamEvent) -> PresentationReceipt:
         """Project input notify and temporary stream without replacing final delivery."""
@@ -409,7 +448,17 @@ class QQBotAdapter:
         if event.kind is TurnStreamEventKind.TURN_STARTED:
             payload = cast(TurnStartedPresentation, event.payload)
             recipient = self._message_recipients.pop(payload.client_message_id, None)
+            provider_identity = self._message_identities.pop(
+                payload.client_message_id,
+                None,
+            )
+            if recipient is None and provider_identity is not None:
+                identity = self._identity
+                if identity is None:
+                    raise RuntimeError("QQBot identity port 未绑定")
+                recipient = identity.resolve(provider_identity)
             if recipient is None:
+                self._live_disabled.add(event.presentation_id)
                 return PresentationReceipt(
                     event.presentation_id,
                     DeliveryStatus.REJECTED,
@@ -421,6 +470,11 @@ class QQBotAdapter:
                 recipient,
                 payload.client_message_id,
             )
+            if status is DeliveryStatus.UNKNOWN:
+                self._live_uncertain.add(event.presentation_id)
+                self._live_disabled.add(event.presentation_id)
+            elif status is DeliveryStatus.REJECTED:
+                self._live_disabled.add(event.presentation_id)
             return PresentationReceipt(
                 event.presentation_id,
                 status,
@@ -438,6 +492,18 @@ class QQBotAdapter:
         return PresentationReceipt(event.presentation_id, DeliveryStatus.DELIVERED)
 
     async def _refresh_preview(self, presentation_id: str) -> PresentationReceipt:
+        if presentation_id in self._live_uncertain:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.UNKNOWN,
+                error="QQBot preview 外部效果未确认，已停止后续 patch",
+            )
+        if presentation_id in self._live_disabled:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot preview 已关闭",
+            )
         recipient = self._presentation_recipients.get(presentation_id)
         text = _tail_text(self._reply_buffers.get(presentation_id, "").strip(), _REPLY_LIVE_TAIL)
         if recipient is None or not text:
@@ -459,6 +525,12 @@ class QQBotAdapter:
         recipient: str,
         text: str,
     ) -> PresentationReceipt:
+        if presentation_id in self._live_uncertain:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.UNKNOWN,
+                error="QQBot preview 外部效果未确认，已停止后续 patch",
+            )
         if presentation_id in self._live_disabled:
             return PresentationReceipt(
                 presentation_id,
@@ -489,11 +561,16 @@ class QQBotAdapter:
             }
             if state.stream_msg_id:
                 body["stream_msg_id"] = state.stream_msg_id
-            status, payload, error = await self._request_with_status(
-                "POST",
-                f"/v2/users/{openid}/stream_messages",
-                body,
-            )
+            try:
+                status, payload, error = await self._request_with_status(
+                    "POST",
+                    f"/v2/users/{openid}/stream_messages",
+                    body,
+                )
+            except asyncio.CancelledError:
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+                raise
             if status is DeliveryStatus.DELIVERED:
                 remote_id = payload.get("id")
                 if isinstance(remote_id, str) and remote_id.strip():
@@ -508,15 +585,14 @@ class QQBotAdapter:
                         "外部效果未确认"
                     )
                     self._live_uncertain.add(presentation_id)
+            if status is DeliveryStatus.UNKNOWN:
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+            elif status is DeliveryStatus.REJECTED:
+                self._live_disabled.add(presentation_id)
             if status is not DeliveryStatus.DELIVERED:
                 failures = self._live_failures.get(presentation_id, 0) + 1
                 self._live_failures[presentation_id] = failures
-                if (
-                    status is DeliveryStatus.REJECTED
-                    or presentation_id in self._live_uncertain
-                    or failures >= _LIVE_MAX_FAILURES
-                ):
-                    self._live_disabled.add(presentation_id)
             return PresentationReceipt(
                 presentation_id,
                 status,
@@ -528,8 +604,6 @@ class QQBotAdapter:
         state = self._live_states.get(presentation_id)
         clear_state = True
         try:
-            if state is None:
-                return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
             if presentation_id in self._live_uncertain:
                 clear_state = False
                 return PresentationReceipt(
@@ -537,14 +611,32 @@ class QQBotAdapter:
                     DeliveryStatus.UNKNOWN,
                     error="QQBot preview 外部效果未确认，保留本地失败状态",
                 )
+            if presentation_id in self._live_disabled and (
+                state is None or not state.stream_msg_id
+            ):
+                return PresentationReceipt(
+                    presentation_id,
+                    DeliveryStatus.REJECTED,
+                    error="QQBot preview 已拒绝，未产生可清理的远端消息",
+                )
+            if state is None:
+                return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
             if not state.stream_msg_id:
                 return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
-            status, _payload, error = await self._request_with_status(
-                "DELETE",
-                f"/v2/users/{state.openid}/messages/{state.stream_msg_id}",
-            )
+            try:
+                status, _payload, error = await self._request_with_status(
+                    "DELETE",
+                    f"/v2/users/{state.openid}/messages/{state.stream_msg_id}",
+                )
+            except asyncio.CancelledError:
+                clear_state = False
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+                raise
             if status is DeliveryStatus.UNKNOWN:
                 clear_state = False
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
             return PresentationReceipt(
                 presentation_id,
                 status,
@@ -713,6 +805,7 @@ class QQBotAdapter:
         for presentation_id in tuple(self._presentation_recipients):
             self._clear_presentation(presentation_id)
         self._message_recipients.clear()
+        self._message_identities.clear()
 
 
 def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
@@ -723,6 +816,20 @@ def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
     if not isinstance(value, tuple) or any(not isinstance(item, str) for item in value):
         raise TypeError("QQBot allow_from 必须是字符串 tuple")
     return frozenset(item for item in value if item)
+
+
+def _has_provider_attachments(data: Mapping[str, Any]) -> bool:
+    """Reject provider media payloads while the v3 adapter remains text-only."""
+
+    attachments = data.get("attachments")
+    if attachments is not None and (
+        not isinstance(attachments, list) or bool(attachments)
+    ):
+        return True
+    return any(
+        key in data and data[key] not in (None, "", [], {})
+        for key in ("image", "file", "media")
+    )
 
 
 def _parse_recipient(recipient: str) -> tuple[str, str]:
@@ -747,3 +854,19 @@ def _tail_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return "..." + text[-(limit - 3) :]
+
+
+async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
+    """Finish critical cleanup before restoring caller cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result

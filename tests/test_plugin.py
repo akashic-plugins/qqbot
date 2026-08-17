@@ -94,9 +94,13 @@ class FakeIngress:
 
 
 class FakeIdentity:
+    def __init__(self, values: dict[str, str] | None = None) -> None:
+        self.values = values or {}
+        self.lookups: list[str] = []
+
     def resolve(self, provider_identity: str) -> str | None:
-        _ = provider_identity
-        return None
+        self.lookups.append(provider_identity)
+        return self.values.get(provider_identity)
 
 
 class FakeControl:
@@ -129,10 +133,13 @@ class FakeSubscription:
 
 
 class FakeTurnStream:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_subscribe: bool = False) -> None:
         self.subscription: FakeSubscription | None = None
+        self.fail_subscribe = fail_subscribe
 
     def subscribe(self, callback) -> FakeSubscription:
+        if self.fail_subscribe:
+            raise RuntimeError("stream subscribe failed")
         self.subscription = FakeSubscription(callback)
         return self.subscription
 
@@ -141,6 +148,7 @@ def _context(
     *,
     factory: FakeProviderFactory | None = None,
     ingress: FakeIngress | None = None,
+    identity: FakeIdentity | None = None,
     control: FakeControl | None = None,
     stream: FakeTurnStream | None = None,
     config: dict[str, object] | None = None,
@@ -156,7 +164,7 @@ def _context(
         },
         provider_client_factory=factory or FakeProviderFactory(),
         ingress=ingress or FakeIngress(),
-        identity=FakeIdentity(),
+        identity=identity or FakeIdentity(),
         control=control or FakeControl(),
         turn_stream=stream or FakeTurnStream(),
     )
@@ -261,6 +269,44 @@ async def test_formal_start_delivery_and_stop_use_controlled_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_cancellation_waits_for_internal_cleanup() -> None:
+    release = asyncio.Event()
+    cleanup_started = asyncio.Event()
+
+    class BlockingSubscription(FakeSubscription):
+        async def await_quiescence(self) -> None:
+            cleanup_started.set()
+            await release.wait()
+
+    class BlockingTurnStream(FakeTurnStream):
+        def subscribe(self, callback) -> BlockingSubscription:
+            self.subscription = BlockingSubscription(callback)
+            return self.subscription
+
+    factory = FakeProviderFactory()
+    stream = BlockingTurnStream()
+    adapter = module.build_qqbot_channel(_context(factory=factory, stream=stream))
+
+    async def gateway() -> None:
+        await adapter._stopped.wait()
+
+    adapter._gateway_loop = gateway
+    adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
+    await adapter.start()
+
+    stopping = asyncio.create_task(adapter.stop())
+    await cleanup_started.wait()
+    stopping.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert stream.subscription is not None and stream.subscription.closed
+    assert factory.client.closed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("credentials", "missing"),
     [
@@ -285,6 +331,22 @@ async def test_formal_start_rejects_missing_credential_before_resources(
         await adapter.start()
 
     assert factory.create_calls == 0
+    assert adapter._provider_client is None
+    assert adapter._client is None
+    assert adapter._gateway_task is None
+
+
+@pytest.mark.asyncio
+async def test_start_failure_closes_provider_resources_before_reraising() -> None:
+    factory = FakeProviderFactory()
+    stream = FakeTurnStream(fail_subscribe=True)
+    adapter = module.build_qqbot_channel(_context(factory=factory, stream=stream))
+    adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
+
+    with pytest.raises(RuntimeError, match="stream subscribe failed"):
+        await adapter.start()
+
+    assert factory.client.closed
     assert adapter._provider_client is None
     assert adapter._client is None
     assert adapter._gateway_task is None
@@ -372,6 +434,77 @@ async def test_inbound_is_allowlisted_and_stop_uses_control_port() -> None:
         {"id": "msg-4", "content": "blocked", "author": {"user_openid": "allowed"}}
     )
     assert closed_ingress.raw == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_attachment_is_rejected_without_admission() -> None:
+    ingress = FakeIngress()
+    adapter = module.build_qqbot_channel(_context(ingress=ingress))
+
+    status = await adapter._handle_c2c(
+        {
+            "id": "media-1",
+            "content": "image",
+            "attachments": [{"url": "https://example.test/image"}],
+            "author": {"user_openid": "allowed"},
+        }
+    )
+
+    assert status is DeliveryStatus.REJECTED
+    assert ingress.raw == []
+
+
+@pytest.mark.asyncio
+async def test_turn_started_uses_core_identity_when_local_recipient_is_missing() -> None:
+    identity = FakeIdentity({"allowed": "c2c:resolved"})
+    adapter = module.build_qqbot_channel(_context(identity=identity))
+    adapter._message_identities["msg-1"] = "allowed"
+
+    async def notify(_recipient: str, _message_id: str):
+        return DeliveryStatus.DELIVERED, None, None
+
+    adapter._send_input_notify = notify
+    receipt = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-identity",
+            TurnStreamEventKind.TURN_STARTED,
+            TurnStartedPresentation("turn-identity", "msg-1"),
+        )
+    )
+
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert identity.lookups == ["allowed"]
+    assert adapter._presentation_recipients["preview:turn-identity"] == "c2c:resolved"
+
+
+@pytest.mark.asyncio
+async def test_turn_started_without_identity_closes_preview_as_rejected() -> None:
+    adapter = module.build_qqbot_channel(_context())
+    started = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-missing",
+            TurnStreamEventKind.TURN_STARTED,
+            TurnStartedPresentation("turn-missing", "unknown-message"),
+        )
+    )
+    delta = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-missing",
+            TurnStreamEventKind.STREAM_DELTA,
+            StreamDeltaPresentation("turn-missing", 1, "answer", ""),
+        )
+    )
+    completed = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-missing",
+            TurnStreamEventKind.TURN_OUTPUT_COMPLETED,
+            TurnOutputCompletedPresentation("turn-missing", 2),
+        )
+    )
+
+    assert started.status is DeliveryStatus.REJECTED
+    assert delta.status is DeliveryStatus.REJECTED
+    assert completed.status is DeliveryStatus.REJECTED
 
 
 @pytest.mark.asyncio
@@ -490,6 +623,16 @@ async def test_preview_missing_remote_id_is_unknown_and_not_deleted() -> None:
     assert [method for method, _path in calls] == ["POST", "POST"]
     assert "preview:turn-1" in adapter._live_states
     assert "preview:turn-1" in adapter._live_uncertain
+
+    retry = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-1",
+            TurnStreamEventKind.STREAM_DELTA,
+            StreamDeltaPresentation("turn-1", 3, "retry", ""),
+        )
+    )
+    assert retry.status is DeliveryStatus.UNKNOWN
+    assert [method for method, _path in calls] == ["POST", "POST"]
 
 
 @pytest.mark.asyncio
