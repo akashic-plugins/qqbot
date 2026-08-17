@@ -113,6 +113,7 @@ class QQBotAdapter:
         self._live_last_lengths: dict[str, int] = {}
         self._live_failures: dict[str, int] = {}
         self._live_disabled: set[str] = set()
+        self._live_uncertain: set[str] = set()
         self._live_locks: dict[str, asyncio.Lock] = {}
 
     def attach_presentation(self, ports: ChannelPresentationPorts) -> None:
@@ -132,11 +133,15 @@ class QQBotAdapter:
         if self._presentation is None:
             raise RuntimeError("QQBot adapter 缺少 presentation ports")
 
-        # 1. Resolve only through the formal provider factory.
+        # 1. Validate both credential identities before acquiring any resource.
+        self._credential_ref("app_id")
+        self._credential_ref("client_secret")
+
+        # 2. Resolve only through the formal provider factory.
         self._provider_client = await self._provider_factory.create(self._credentials)
         self._client = httpx.AsyncClient(timeout=30.0)
 
-        # 2. Attach the exact presentation callback before receiving provider input.
+        # 3. Attach the exact presentation callback before receiving provider input.
         turn_stream = self._presentation.turn_stream
         if turn_stream is None:
             raise RuntimeError("QQBot turn stream port 未绑定")
@@ -171,6 +176,20 @@ class QQBotAdapter:
                 request.delivery_id,
                 DeliveryStatus.REJECTED,
                 error="QQBot 空消息被拒绝",
+            )
+        if not isinstance(request.recipient, str):
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot recipient 必须是字符串",
+            )
+        try:
+            _parse_recipient(request.recipient)
+        except ValueError as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error=str(error),
             )
         status, provider_id, error = await self._send_text(
             request.recipient,
@@ -259,7 +278,14 @@ class QQBotAdapter:
             async with websockets.connect(url) as websocket:
                 async for raw in websocket:
                     payload = json.loads(raw)
-                    data = _as_dict(payload.get("d"))
+                    if not isinstance(payload, dict):
+                        logger.warning("[qqbot] 拒绝非 object gateway payload")
+                        continue
+                    raw_data = payload.get("d")
+                    if not isinstance(raw_data, dict):
+                        logger.warning("[qqbot] 拒绝非 object gateway data")
+                        continue
+                    data = cast(dict[str, Any], raw_data)
                     if isinstance(payload.get("s"), int):
                         last_seq = int(payload["s"])
                     if payload.get("op") == 10:
@@ -311,10 +337,30 @@ class QQBotAdapter:
             logger.debug("[qqbot] 当前仅启用私聊模式，忽略群事件 event=%s", event_type)
 
     async def _handle_c2c(self, data: dict[str, Any]) -> None:
-        author = _as_dict(data.get("author"))
-        openid = str(author.get("user_openid") or data.get("user_openid") or "").strip()
-        message_id = str(data.get("id") or "").strip()
-        content = str(data.get("content") or "").strip()
+        if not isinstance(data, dict):
+            logger.warning("[qqbot] 拒绝非 object 私聊 data")
+            return
+        raw_author = data.get("author")
+        if raw_author is not None and not isinstance(raw_author, dict):
+            logger.warning("[qqbot] 拒绝非 object 私聊 author")
+            return
+        author = raw_author if isinstance(raw_author, dict) else {}
+        raw_openid = (
+            author["user_openid"]
+            if "user_openid" in author
+            else data.get("user_openid")
+        )
+        if not isinstance(raw_openid, str):
+            logger.warning("[qqbot] 拒绝非 string user_openid")
+            return
+        openid = raw_openid.strip()
+        raw_message_id = data.get("id")
+        raw_content = data.get("content")
+        if not isinstance(raw_message_id, str) or not isinstance(raw_content, str):
+            logger.warning("[qqbot] 拒绝非 string identity/message/content")
+            return
+        message_id = raw_message_id.strip()
+        content = raw_content.strip()
         if not openid or not message_id or not content:
             logger.warning("[qqbot] 拒绝缺少 identity/message/content 的私聊事件")
             return
@@ -449,13 +495,27 @@ class QQBotAdapter:
                 body,
             )
             if status is DeliveryStatus.DELIVERED:
-                state.stream_msg_id = str(payload.get("id") or state.stream_msg_id)
-                state.index += 1
-                self._live_failures[presentation_id] = 0
-            else:
+                remote_id = payload.get("id")
+                if isinstance(remote_id, str) and remote_id.strip():
+                    state.stream_msg_id = remote_id.strip()
+                    state.index += 1
+                    self._live_failures[presentation_id] = 0
+                    self._live_uncertain.discard(presentation_id)
+                else:
+                    status = DeliveryStatus.UNKNOWN
+                    error = (
+                        "QQBot preview 2xx response 缺少 stream message id，"
+                        "外部效果未确认"
+                    )
+                    self._live_uncertain.add(presentation_id)
+            if status is not DeliveryStatus.DELIVERED:
                 failures = self._live_failures.get(presentation_id, 0) + 1
                 self._live_failures[presentation_id] = failures
-                if status is DeliveryStatus.REJECTED or failures >= _LIVE_MAX_FAILURES:
+                if (
+                    status is DeliveryStatus.REJECTED
+                    or presentation_id in self._live_uncertain
+                    or failures >= _LIVE_MAX_FAILURES
+                ):
                     self._live_disabled.add(presentation_id)
             return PresentationReceipt(
                 presentation_id,
@@ -466,13 +526,25 @@ class QQBotAdapter:
 
     async def _finish_preview(self, presentation_id: str) -> PresentationReceipt:
         state = self._live_states.get(presentation_id)
+        clear_state = True
         try:
-            if state is None or not state.stream_msg_id:
+            if state is None:
+                return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+            if presentation_id in self._live_uncertain:
+                clear_state = False
+                return PresentationReceipt(
+                    presentation_id,
+                    DeliveryStatus.UNKNOWN,
+                    error="QQBot preview 外部效果未确认，保留本地失败状态",
+                )
+            if not state.stream_msg_id:
                 return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
             status, _payload, error = await self._request_with_status(
                 "DELETE",
                 f"/v2/users/{state.openid}/messages/{state.stream_msg_id}",
             )
+            if status is DeliveryStatus.UNKNOWN:
+                clear_state = False
             return PresentationReceipt(
                 presentation_id,
                 status,
@@ -480,7 +552,8 @@ class QQBotAdapter:
                 error,
             )
         finally:
-            self._clear_presentation(presentation_id)
+            if clear_state:
+                self._clear_presentation(presentation_id)
 
     async def _send_input_notify(
         self,
@@ -633,6 +706,7 @@ class QQBotAdapter:
         self._live_last_lengths.pop(presentation_id, None)
         self._live_failures.pop(presentation_id, None)
         self._live_disabled.discard(presentation_id)
+        self._live_uncertain.discard(presentation_id)
         self._live_locks.pop(presentation_id, None)
 
     def _clear_presentations(self) -> None:
@@ -655,6 +729,8 @@ def _parse_recipient(recipient: str) -> tuple[str, str]:
     value = recipient.strip()
     if value.startswith("qqbot:"):
         value = value[len("qqbot:") :]
+    if not value:
+        raise ValueError(f"无效的 QQBot recipient: {recipient!r}")
     if ":" not in value:
         return "c2c", value
     kind, target = value.split(":", 1)
@@ -665,10 +741,6 @@ def _parse_recipient(recipient: str) -> tuple[str, str]:
 
 def _next_msg_seq() -> int:
     return int(time.time() * 1000) % 65536
-
-
-def _as_dict(value: object) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
 
 
 def _tail_text(text: str, limit: int) -> str:

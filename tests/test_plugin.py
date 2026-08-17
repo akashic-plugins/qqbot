@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -260,6 +261,36 @@ async def test_formal_start_delivery_and_stop_use_controlled_client() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credentials", "missing"),
+    [
+        ({"appId": CredentialRef(("appId",))}, "client_secret"),
+        ({"clientSecret": CredentialRef(("clientSecret",))}, "app_id"),
+    ],
+)
+async def test_formal_start_rejects_missing_credential_before_resources(
+    credentials: dict[str, CredentialRef],
+    missing: str,
+) -> None:
+    factory = FakeProviderFactory()
+    stream = FakeTurnStream()
+    context = replace(
+        _context(factory=factory, stream=stream),
+        credentials=credentials,
+    )
+    adapter = module.build_qqbot_channel(context)
+    adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
+
+    with pytest.raises(RuntimeError, match=missing):
+        await adapter.start()
+
+    assert factory.create_calls == 0
+    assert adapter._provider_client is None
+    assert adapter._client is None
+    assert adapter._gateway_task is None
+
+
+@pytest.mark.asyncio
 async def test_attachment_is_rejected_before_provider_effect() -> None:
     factory = FakeProviderFactory()
     adapter = module.build_qqbot_channel(_context(factory=factory))
@@ -282,6 +313,29 @@ async def test_attachment_is_rejected_before_provider_effect() -> None:
     )
     assert receipt.status is DeliveryStatus.REJECTED
     assert factory.create_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recipient", ["group:group-1"])
+async def test_invalid_recipient_returns_rejected_without_provider_effect(
+    recipient: str,
+) -> None:
+    adapter = module.build_qqbot_channel(_context())
+    called = False
+
+    async def send(_recipient: str, _message: str):
+        nonlocal called
+        called = True
+        return DeliveryStatus.DELIVERED, "provider-1", None
+
+    adapter._send_text = send
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest("binding-1", "delivery-1", recipient, "body")
+    )
+
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert receipt.error is not None
+    assert not called
 
 
 @pytest.mark.asyncio
@@ -318,6 +372,28 @@ async def test_inbound_is_allowlisted_and_stop_uses_control_port() -> None:
         {"id": "msg-4", "content": "blocked", "author": {"user_openid": "allowed"}}
     )
     assert closed_ingress.raw == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"id": "msg-1", "content": "hello", "author": {"user_openid": 7}},
+        {"id": "msg-2", "content": 7, "author": {"user_openid": "allowed"}},
+        {"id": 7, "content": "hello", "author": {"user_openid": "allowed"}},
+        {"id": "msg-4", "content": "hello", "author": []},
+        {"id": "msg-5", "content": "hello", "user_openid": 7},
+    ],
+)
+async def test_inbound_identity_and_payload_types_fail_closed(
+    payload: dict[str, object],
+) -> None:
+    ingress = FakeIngress()
+    adapter = module.build_qqbot_channel(_context(ingress=ingress))
+
+    await adapter._handle_c2c(payload)
+
+    assert ingress.raw == []
 
 
 @pytest.mark.asyncio
@@ -371,6 +447,49 @@ async def test_turn_preview_never_substitutes_final_delivery() -> None:
     )
     assert final_receipt.status is DeliveryStatus.DELIVERED
     assert final_calls == ["answer"]
+
+
+@pytest.mark.asyncio
+async def test_preview_missing_remote_id_is_unknown_and_not_deleted() -> None:
+    adapter = module.build_qqbot_channel(_context())
+    adapter._message_recipients["msg-1"] = "c2c:allowed"
+    calls: list[tuple[str, str]] = []
+
+    async def request(method: str, path: str, body=None):
+        _ = body
+        calls.append((method, path))
+        return DeliveryStatus.DELIVERED, {}, None
+
+    adapter._request_with_status = request
+    started = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-1",
+            TurnStreamEventKind.TURN_STARTED,
+            TurnStartedPresentation("turn-1", "msg-1"),
+        )
+    )
+    preview = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-1",
+            TurnStreamEventKind.STREAM_DELTA,
+            StreamDeltaPresentation("turn-1", 1, "x" * 120, ""),
+        )
+    )
+    completed = await adapter._on_turn_stream(
+        TurnStreamEvent(
+            "preview:turn-1",
+            TurnStreamEventKind.TURN_OUTPUT_COMPLETED,
+            TurnOutputCompletedPresentation("turn-1", 2),
+        )
+    )
+
+    assert started.status is DeliveryStatus.DELIVERED
+    assert preview.status is DeliveryStatus.UNKNOWN
+    assert completed.status is DeliveryStatus.UNKNOWN
+    assert preview.error is not None and "缺少 stream message id" in preview.error
+    assert [method for method, _path in calls] == ["POST", "POST"]
+    assert "preview:turn-1" in adapter._live_states
+    assert "preview:turn-1" in adapter._live_uncertain
 
 
 @pytest.mark.asyncio
