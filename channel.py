@@ -9,6 +9,7 @@ import json
 import logging
 import mimetypes
 import time
+from urllib.parse import urlsplit
 from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,6 +58,10 @@ _CREDENTIAL_ALIASES = {
     "client_secret": ("clientSecret", "client_secret"),
 }
 _MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_MAX_ATTACHMENT_COUNT = 16
+_MAX_ATTACHMENT_BATCH_BYTES = 100 * 1024 * 1024
+_MAX_PROVIDER_SEGMENT_LENGTH = 256
+_QQ_MEDIA_HOSTS = frozenset({"multimedia.nt.qq.com.cn"})
 
 
 @dataclass(slots=True)
@@ -111,6 +116,9 @@ class QQBotAdapter:
         self._stopped = asyncio.Event()
         self._started = False
         self._stopping = False
+        self._admission_open = False
+        self._runtime: Any | None = None
+        self._inbound_tasks: set[asyncio.Task[DeliveryStatus]] = set()
 
         self._message_recipients: dict[str, str] = {}
         self._message_identities: dict[str, str] = {}
@@ -133,6 +141,29 @@ class QQBotAdapter:
         if ports.control is None or ports.turn_stream is None:
             raise RuntimeError("QQBot v3 必须同时绑定 control 与 turn_stream")
         self._presentation = ports
+
+    def attach_runtime(self, runtime: Any) -> None:
+        """Bind the exact Host runtime lifecycle owner without replacing context ports."""
+
+        if self._runtime is not None:
+            raise RuntimeError("QQBot runtime 不能重复绑定")
+        if runtime is None:
+            raise TypeError("QQBot runtime 不能为空")
+        if getattr(runtime, "binding_token", None) != self._binding_token:
+            raise RuntimeError("QQBot runtime binding token 不匹配")
+        self._runtime = runtime
+
+    def open_admission(self) -> None:
+        """Allow provider ingress only after Core has published this binding."""
+
+        if self._stopping:
+            raise RuntimeError("QQBot adapter 正在停止")
+        self._admission_open = True
+
+    def close_admission(self) -> None:
+        """Reject new provider ingress while accepted gateway work drains."""
+
+        self._admission_open = False
 
     async def start(self) -> ChannelReady:
         """Create formal provider resources and start the gateway closed."""
@@ -224,6 +255,7 @@ class QQBotAdapter:
 
         # 2. Send text first, then media in exact request order.
         provider_ids: list[str] = []
+        delivered_any = False
         if request.body.strip():
             status, provider_id, error = await self._send_text(
                 request.recipient,
@@ -231,8 +263,10 @@ class QQBotAdapter:
             )
             if provider_id:
                 provider_ids.append(provider_id)
+            if status is DeliveryStatus.DELIVERED:
+                delivered_any = True
             if status is not DeliveryStatus.DELIVERED:
-                if provider_ids and status is DeliveryStatus.REJECTED:
+                if delivered_any and status is DeliveryStatus.REJECTED:
                     status = DeliveryStatus.UNKNOWN
                 return ProviderDeliveryReceipt(
                     request.delivery_id,
@@ -248,7 +282,11 @@ class QQBotAdapter:
             )
             if provider_id:
                 provider_ids.append(provider_id)
+            if status is DeliveryStatus.DELIVERED:
+                delivered_any = True
             if status is not DeliveryStatus.DELIVERED:
+                if delivered_any and status is DeliveryStatus.REJECTED:
+                    status = DeliveryStatus.UNKNOWN
                 return ProviderDeliveryReceipt(
                     request.delivery_id,
                     status,
@@ -269,10 +307,16 @@ class QQBotAdapter:
 
         if not refs:
             return []
+        if len(refs) > _MAX_ATTACHMENT_COUNT:
+            raise ValueError("QQBot 附件数量超过上限")
+        declared_total = sum(ref.size_bytes for ref in refs)
+        if declared_total > _MAX_ATTACHMENT_BATCH_BYTES:
+            raise ValueError("QQBot 附件批次超过总大小上限")
         attachment_read = self._context.attachment_read
         if attachment_read is None:
             raise RuntimeError("QQBot outbound 附件缺少 Core attachment_read")
         result: list[tuple[AttachmentRef, bytes]] = []
+        actual_total = 0
         for ref in refs:
             lease = await attachment_read.acquire(ref)
             try:
@@ -287,6 +331,9 @@ class QQBotAdapter:
                     )
                 if hashlib.sha256(data).hexdigest() != ref.sha256:
                     raise ValueError("附件 sha256 不匹配")
+                actual_total += len(data)
+                if actual_total > _MAX_ATTACHMENT_BATCH_BYTES:
+                    raise ValueError("QQBot 附件批次超过总大小上限")
                 result.append((ref, data))
             finally:
                 await _close_attachment_lease(lease)
@@ -320,6 +367,10 @@ class QQBotAdapter:
         file_info = str(upload_payload.get("file_info") or "").strip()
         if not file_info:
             return DeliveryStatus.UNKNOWN, None, "QQBot media upload response 缺少 file_info"
+        try:
+            _provider_segment(file_info, "QQBot file_info")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
         send_status, send_payload, send_error = await self._request_with_status(
             "POST",
             f"/v2/users/{openid}/messages",
@@ -335,6 +386,10 @@ class QQBotAdapter:
         provider_id = str(send_payload.get("id") or "").strip()
         if not provider_id:
             return DeliveryStatus.UNKNOWN, None, "QQBot rich-media response 缺少 message id"
+        try:
+            _provider_segment(provider_id, "QQBot message_id")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
         return DeliveryStatus.DELIVERED, provider_id, None
 
     async def stop(self) -> StopReceipt:
@@ -353,6 +408,7 @@ class QQBotAdapter:
         """Close every owned resource and retain failed owners for retry."""
 
         self._stopping = True
+        self._admission_open = False
         failures: list[ChannelCleanupFailure] = []
 
         # 1. Close callback admission before provider resources.
@@ -380,7 +436,18 @@ class QQBotAdapter:
             else:
                 self._gateway_task = None
 
-        # 3. Release formal clients; failed owners remain for exact retry.
+        # 3. Let callbacks admitted before close settle before releasing Core ports.
+        tasks = tuple(self._inbound_tasks)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    failures.append(self._cleanup_failure("inbound-task", result))
+        self._inbound_tasks.clear()
+
+        # 4. Release formal clients; failed owners remain for exact retry.
         if self._client is not None:
             try:
                 await self._client.aclose()
@@ -397,6 +464,7 @@ class QQBotAdapter:
                 self._provider_client = None
 
         self._token = None
+        self._admission_open = False
         if failures:
             return StopReceipt(self._binding_token, False, tuple(failures))
         self._started = False
@@ -479,11 +547,22 @@ class QQBotAdapter:
 
     async def _handle_dispatch(self, event_type: str, data: dict[str, Any]) -> None:
         if event_type == "C2C_MESSAGE_CREATE":
-            await self._handle_c2c(data)
+            if not self._admission_open:
+                logger.warning("[qqbot] Core admission 尚未打开，拒绝 provider 入站")
+                return
+            task = asyncio.create_task(
+                self._handle_c2c(data),
+                name=f"qqbot-inbound:{self._context.generation_id}",
+            )
+            self._inbound_tasks.add(task)
+            task.add_done_callback(self._inbound_tasks.discard)
         elif event_type.startswith("GROUP_"):
             logger.debug("[qqbot] 当前仅启用私聊模式，忽略群事件 event=%s", event_type)
 
     async def _handle_c2c(self, data: dict[str, Any]) -> DeliveryStatus:
+        if not self._admission_open:
+            logger.warning("[qqbot] Core admission 尚未打开，拒绝 provider 入站")
+            return DeliveryStatus.REJECTED
         if not isinstance(data, dict):
             logger.warning("[qqbot] 拒绝非 object 私聊 data")
             return DeliveryStatus.REJECTED
@@ -500,7 +579,12 @@ class QQBotAdapter:
         if not isinstance(raw_openid, str):
             logger.warning("[qqbot] 拒绝非 string user_openid")
             return DeliveryStatus.REJECTED
-        openid = raw_openid.strip()
+        try:
+            _provider_segment(raw_openid, "QQBot user_openid")
+        except ValueError as error:
+            logger.warning("[qqbot] 拒绝非法 user_openid: %s", error)
+            return DeliveryStatus.REJECTED
+        openid = raw_openid
         raw_message_id = data.get("id")
         raw_content = data.get("content")
         if not isinstance(raw_message_id, str):
@@ -509,7 +593,12 @@ class QQBotAdapter:
         if raw_content is not None and not isinstance(raw_content, str):
             logger.warning("[qqbot] 拒绝非 string content")
             return DeliveryStatus.REJECTED
-        message_id = raw_message_id.strip()
+        try:
+            _provider_segment(raw_message_id, "QQBot message_id")
+        except ValueError as error:
+            logger.warning("[qqbot] 拒绝非法 message_id: %s", error)
+            return DeliveryStatus.REJECTED
+        message_id = raw_message_id
         content = raw_content.strip() if isinstance(raw_content, str) else ""
         if not openid or not message_id:
             logger.warning("[qqbot] 拒绝缺少 identity/message 的私聊事件")
@@ -521,10 +610,23 @@ class QQBotAdapter:
             provider_attachments = _provider_attachments(data)
             if provider_attachments is None:
                 raise ValueError("QQBot attachments 字段格式非法")
-            attachments = await self._import_provider_attachments(provider_attachments)
+            # /stop is decided before any provider URL is fetched or imported.
+            if content == "/stop":
+                if provider_attachments:
+                    logger.warning("[qqbot] 拒绝带附件的 /stop message_id=%s", message_id)
+                    return DeliveryStatus.REJECTED
+                attachments: list[AttachmentRef] = []
+            else:
+                attachments = await self._import_provider_attachments(provider_attachments)
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPStatusError, RuntimeError, TypeError, ValueError) as error:
+        except (
+            httpx.HTTPStatusError,
+            httpx.RequestError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
             logger.warning(
                 "[qqbot] 入站附件未能导入 message_id=%s err=%s",
                 message_id,
@@ -591,17 +693,37 @@ class QQBotAdapter:
             raise RuntimeError("QQBot 入站附件缺少 Core attachment_import")
         if self._client is None:
             raise RuntimeError("QQBot HTTP client 尚未 start")
+        if len(provider_attachments) > _MAX_ATTACHMENT_COUNT:
+            raise ValueError("QQBot 入站附件数量超过上限")
+        declared_total = 0
+        for item in provider_attachments:
+            declared_size = item.get("size")
+            if isinstance(declared_size, bool):
+                raise ValueError("QQBot 入站附件 size 格式非法")
+            if isinstance(declared_size, int):
+                if declared_size < 0 or declared_size > _MAX_ATTACHMENT_BYTES:
+                    raise ValueError("QQBot 入站附件 size 超过单文件上限")
+                declared_total += declared_size
+        if declared_total > _MAX_ATTACHMENT_BATCH_BYTES:
+            raise ValueError("QQBot 入站附件批次超过总大小上限")
         refs: list[AttachmentRef] = []
+        downloaded: list[tuple[bytes, AttachmentKind, str, str]] = []
+        actual_total = 0
         for item in provider_attachments:
             url = item.get("url") or item.get("resolved_url")
-            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-                raise ValueError("QQBot 入站附件缺少安全下载 URL")
-            declared_size = item.get("size")
-            if isinstance(declared_size, int) and declared_size > _MAX_ATTACHMENT_BYTES:
-                raise ValueError("QQBot 入站附件超过大小上限")
-            response = await self._client.get(url)
-            response.raise_for_status()
-            data = await _bounded_response_bytes(response)
+            safe_url = _validate_media_url(url)
+            async with self._client.stream(
+                "GET",
+                safe_url,
+                follow_redirects=False,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise ValueError("QQBot 入站附件禁止重定向")
+                response.raise_for_status()
+                data = await _bounded_response_bytes(response)
+            actual_total += len(data)
+            if actual_total > _MAX_ATTACHMENT_BATCH_BYTES:
+                raise ValueError("QQBot 入站附件批次超过总大小上限")
             filename = item.get("filename")
             filename = filename.strip() if isinstance(filename, str) and filename.strip() else "attachment"
             media_type = item.get("content_type")
@@ -611,11 +733,10 @@ class QQBotAdapter:
                 else mimetypes.guess_type(filename)[0] or "application/octet-stream"
             )
             kind = AttachmentKind.IMAGE if media_type.startswith("image/") else AttachmentKind.FILE
+            downloaded.append((data, kind, filename, media_type))
+        for data, kind, filename, media_type in downloaded:
             ref = await attachment_import.import_bytes(
-                data,
-                kind=kind,
-                filename=filename,
-                media_type=media_type,
+                data, kind=kind, filename=filename, media_type=media_type
             )
             if not isinstance(ref, AttachmentRef):
                 raise TypeError("QQBot attachment_import 必须返回 AttachmentRef")
@@ -725,10 +846,15 @@ class QQBotAdapter:
                 raise RuntimeError(
                     f"QQBot preview 缺少 provider message id: {presentation_id}"
                 )
-            state = _LiveStreamState(openid, message_id, _next_msg_seq())
+            state = _LiveStreamState(
+                openid,
+                _provider_segment(message_id, "QQBot message_id"),
+                _next_msg_seq(),
+            )
             self._live_states[presentation_id] = state
         lock = self._live_locks.setdefault(presentation_id, asyncio.Lock())
         async with lock:
+            error: str | None = None
             body: dict[str, Any] = {
                 "input_mode": "replace",
                 "input_state": 1,
@@ -754,10 +880,20 @@ class QQBotAdapter:
             if status is DeliveryStatus.DELIVERED:
                 remote_id = payload.get("id")
                 if isinstance(remote_id, str) and remote_id.strip():
-                    state.stream_msg_id = remote_id.strip()
-                    state.index += 1
-                    self._live_failures[presentation_id] = 0
-                    self._live_uncertain.discard(presentation_id)
+                    try:
+                        state.stream_msg_id = _provider_segment(
+                            remote_id.strip(), "QQBot stream_message_id"
+                        )
+                    except ValueError as validation_error:
+                        status = DeliveryStatus.UNKNOWN
+                        error = str(validation_error)
+                        self._live_uncertain.add(presentation_id)
+                        self._live_disabled.add(presentation_id)
+                        remote_id = None
+                    if remote_id is not None:
+                        state.index += 1
+                        self._live_failures[presentation_id] = 0
+                        self._live_uncertain.discard(presentation_id)
                 else:
                     status = DeliveryStatus.UNKNOWN
                     error = (
@@ -803,6 +939,8 @@ class QQBotAdapter:
                 return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
             if not state.stream_msg_id:
                 return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+            _provider_segment(state.openid, "QQBot user_openid")
+            _provider_segment(state.stream_msg_id, "QQBot stream_message_id")
             try:
                 status, _payload, error = await self._request_with_status(
                     "DELETE",
@@ -833,6 +971,7 @@ class QQBotAdapter:
         message_id: str,
     ) -> tuple[DeliveryStatus, str | None, str | None]:
         _, openid = _parse_recipient(recipient)
+        _provider_segment(message_id, "QQBot message_id")
         status, payload, error = await self._request_with_status(
             "POST",
             f"/v2/users/{openid}/messages",
@@ -844,6 +983,11 @@ class QQBotAdapter:
             },
         )
         provider_id = str(payload.get("id") or "").strip() or None
+        if provider_id is not None:
+            try:
+                _provider_segment(provider_id, "QQBot message_id")
+            except ValueError as error:
+                return DeliveryStatus.UNKNOWN, None, str(error)
         return status, provider_id, error
 
     async def _send_text(
@@ -864,6 +1008,11 @@ class QQBotAdapter:
         provider_id = str(payload.get("id") or "").strip() or None
         if status is DeliveryStatus.DELIVERED and provider_id is None:
             return DeliveryStatus.UNKNOWN, None, "QQBot response 缺少 message id"
+        if provider_id is not None:
+            try:
+                _provider_segment(provider_id, "QQBot message_id")
+            except ValueError as error:
+                return DeliveryStatus.UNKNOWN, None, str(error)
         return status, provider_id, error
 
     async def _request_with_status(
@@ -884,6 +1033,13 @@ class QQBotAdapter:
                 else DeliveryStatus.UNKNOWN
             )
             return delivery, {}, f"HTTP {status}"
+        except httpx.RequestError as error:
+            delivery = (
+                DeliveryStatus.REJECTED
+                if _is_pre_effect_request_error(error)
+                else DeliveryStatus.UNKNOWN
+            )
+            return delivery, {}, str(error) or type(error).__name__
         except Exception as error:
             return DeliveryStatus.UNKNOWN, {}, str(error) or type(error).__name__
         return DeliveryStatus.DELIVERED, payload, None
@@ -1029,18 +1185,69 @@ def _has_provider_attachments(data: Mapping[str, Any]) -> bool:
     return attachments is None or bool(attachments)
 
 
+def _provider_segment(value: object, field_name: str) -> str:
+    """Validate an opaque QQ provider value before putting it in a URL path."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} 不能为空")
+    if value != value.strip():
+        raise ValueError(f"{field_name} 不能包含首尾空白")
+    if len(value) > _MAX_PROVIDER_SEGMENT_LENGTH:
+        raise ValueError(f"{field_name} 超过长度上限")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} 不能包含路径分隔符")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{field_name} 不能包含控制字符")
+    return value
+
+
+def _validate_media_url(value: object) -> str:
+    """Allow only HTTPS QQ media URLs without redirects or user-controlled hosts."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("QQBot 入站附件缺少安全下载 URL")
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in _QQ_MEDIA_HOSTS:
+        raise ValueError("QQBot 入站附件 URL 必须是受限 QQ HTTPS 媒体域名")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("QQBot 入站附件 URL 禁止 userinfo")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("QQBot 入站附件 URL 端口非法") from error
+    if port not in (None, 443):
+        raise ValueError("QQBot 入站附件 URL 端口非法")
+    return value
+
+
+def _is_pre_effect_request_error(error: httpx.RequestError) -> bool:
+    """Classify only connection setup failures as deterministic no-effect errors."""
+
+    return isinstance(
+        error,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ProxyError,
+            httpx.UnsupportedProtocol,
+            httpx.InvalidURL,
+        ),
+    )
+
+
 def _parse_recipient(recipient: str) -> tuple[str, str]:
-    value = recipient.strip()
+    _provider_segment(recipient, "QQBot recipient")
+    value = recipient
     if value.startswith("qqbot:"):
         value = value[len("qqbot:") :]
     if not value:
         raise ValueError(f"无效的 QQBot recipient: {recipient!r}")
     if ":" not in value:
-        return "c2c", value
+        return "c2c", _provider_segment(value, "QQBot user_openid")
     kind, target = value.split(":", 1)
     if kind != "c2c" or not target:
         raise ValueError(f"无效的 QQBot recipient: {recipient!r}")
-    return kind, target
+    return kind, _provider_segment(target, "QQBot user_openid")
 
 
 def _next_msg_seq() -> int:
@@ -1078,22 +1285,17 @@ async def _bounded_response_bytes(response: Any) -> bytes:
     chunks: list[bytes] = []
     total = 0
     aiter_bytes = getattr(response, "aiter_bytes", None)
-    if callable(aiter_bytes):
-        aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
-        async for chunk in aiter_bytes():
-            if not isinstance(chunk, bytes):
-                raise TypeError("QQBot provider response chunk 必须是 bytes")
-            total += len(chunk)
-            if total > _MAX_ATTACHMENT_BYTES:
-                raise ValueError("QQBot 入站附件超过大小上限")
-            chunks.append(chunk)
-        return b"".join(chunks)
-    data = response.content
-    if not isinstance(data, bytes):
-        raise TypeError("QQBot provider response content 必须是 bytes")
-    if len(data) > _MAX_ATTACHMENT_BYTES:
-        raise ValueError("QQBot 入站附件超过大小上限")
-    return data
+    if not callable(aiter_bytes):
+        raise TypeError("QQBot provider response 必须提供 aiter_bytes")
+    aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
+    async for chunk in aiter_bytes():
+        if not isinstance(chunk, bytes):
+            raise TypeError("QQBot provider response chunk 必须是 bytes")
+        total += len(chunk)
+        if total > _MAX_ATTACHMENT_BYTES:
+            raise ValueError("QQBot 入站附件超过大小上限")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:

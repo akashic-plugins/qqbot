@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from agent.plugin_composition.channels import (
     AttachmentKind,
@@ -512,6 +513,67 @@ async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> 
 
 
 @pytest.mark.asyncio
+async def test_delivery_after_prior_success_aggregates_later_rejection_as_unknown() -> None:
+    data = b"x"
+    attachment = AttachmentRef(
+        artifact_id="aggregate-1",
+        kind=AttachmentKind.FILE,
+        filename="a.txt",
+        media_type="text/plain",
+        size_bytes=1,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    adapter = module.build_qqbot_channel(
+        _context(attachment_read=FakeAttachmentRead({"aggregate-1": (attachment, data)}))
+    )
+
+    async def read(_refs):
+        return [(attachment, data)]
+
+    async def send_text(_recipient, _message):
+        return DeliveryStatus.DELIVERED, "text-id", None
+
+    async def send_attachment(_recipient, _ref, _data):
+        return DeliveryStatus.REJECTED, None, "HTTP 400"
+
+    adapter._read_attachments = read
+    adapter._send_text = send_text
+    adapter._send_attachment = send_attachment
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            "binding-1", "aggregate-delivery", "c2c:alice", "body", (attachment,)
+        )
+    )
+    assert receipt.status is DeliveryStatus.UNKNOWN
+    assert receipt.provider_ids == ("text-id",)
+
+
+@pytest.mark.asyncio
+async def test_outbound_attachment_count_limit_rejects_before_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module.channel, "_MAX_ATTACHMENT_COUNT", 1)
+    data = b"x"
+    first = AttachmentRef(
+        "limit-1", AttachmentKind.FILE, "a.txt", "text/plain", 1, hashlib.sha256(data).hexdigest()
+    )
+    second = AttachmentRef(
+        "limit-2", AttachmentKind.FILE, "b.txt", "text/plain", 1, hashlib.sha256(data).hexdigest()
+    )
+    read = FakeAttachmentRead(
+        {"limit-1": (first, data), "limit-2": (second, data)}
+    )
+    adapter = module.build_qqbot_channel(_context(attachment_read=read))
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            "binding-1", "limit-delivery", "c2c:alice", "", (first, second)
+        )
+    )
+    assert receipt.status is DeliveryStatus.REJECTED
+    assert read.leases == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("recipient", ["group:group-1"])
 async def test_invalid_recipient_returns_rejected_without_provider_effect(
     recipient: str,
@@ -543,6 +605,7 @@ async def test_inbound_is_allowlisted_and_stop_uses_control_port() -> None:
         _context(ingress=ingress, control=control, stream=stream)
     )
     adapter.attach_presentation(ChannelPresentationPorts(control, stream))
+    adapter.open_admission()
     await adapter._handle_c2c(
         {"id": "msg-1", "content": "hello", "author": {"user_openid": "allowed"}}
     )
@@ -574,17 +637,31 @@ async def test_inbound_is_allowlisted_and_stop_uses_control_port() -> None:
 async def test_inbound_attachment_downloads_and_imports_before_admission() -> None:
     ingress = FakeIngress()
     adapter = module.build_qqbot_channel(_context(ingress=ingress))
+    adapter.open_admission()
 
     class Response:
         content = b"image-bytes"
+        status_code = 200
 
         def raise_for_status(self) -> None:
             return None
 
-    class Client:
-        async def get(self, url: str) -> Response:
-            assert url == "https://example.test/image"
+        async def aiter_bytes(self):
+            yield self.content
+
+    class Stream:
+        async def __aenter__(self) -> Response:
             return Response()
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class Client:
+        def stream(self, method: str, url: str, **kwargs) -> Stream:
+            assert method == "GET"
+            assert url == "https://multimedia.nt.qq.com.cn/image"
+            assert kwargs["follow_redirects"] is False
+            return Stream()
 
     adapter._client = Client()
 
@@ -592,7 +669,7 @@ async def test_inbound_attachment_downloads_and_imports_before_admission() -> No
         {
             "id": "media-1",
             "content": "image",
-            "attachments": [{"url": "https://example.test/image"}],
+            "attachments": [{"url": "https://multimedia.nt.qq.com.cn/image"}],
             "author": {"user_openid": "allowed"},
         }
     )
@@ -601,6 +678,160 @@ async def test_inbound_attachment_downloads_and_imports_before_admission() -> No
     assert len(ingress.raw) == 1
     assert ingress.raw[0].message.content == "image"
     assert ingress.raw[0].message.attachments[0].size_bytes == len(b"image-bytes")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://multimedia.nt.qq.com.cn/image",
+        "https://evil.example/image",
+        "https://multimedia.nt.qq.com.cn@127.0.0.1/image",
+    ],
+)
+async def test_inbound_attachment_url_is_restricted_before_http_request(url: str) -> None:
+    imported = FakeAttachmentImport()
+    adapter = module.build_qqbot_channel(_context(attachment_import=imported))
+    adapter.open_admission()
+
+    class Client:
+        async def get(self, *_args, **_kwargs):
+            raise AssertionError("unsafe URL must not reach HTTP client")
+
+    adapter._client = Client()
+    status = await adapter._handle_c2c(
+        {
+            "id": "unsafe-url",
+            "content": "image",
+            "attachments": [{"url": url}],
+            "author": {"user_openid": "allowed"},
+        }
+    )
+    assert status is DeliveryStatus.REJECTED
+    assert imported.calls == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_redirect_and_batch_limit_create_no_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module.channel, "_MAX_ATTACHMENT_BATCH_BYTES", 3)
+    imported = FakeAttachmentImport()
+    adapter = module.build_qqbot_channel(_context(attachment_import=imported))
+    adapter.open_admission()
+
+    class Response:
+        content = b"xx"
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield self.content
+
+    class Stream:
+        async def __aenter__(self) -> Response:
+            return Response()
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class Client:
+        def stream(self, method: str, url: str, **kwargs) -> Stream:
+            assert method == "GET"
+            assert kwargs["follow_redirects"] is False
+            return Stream()
+
+    adapter._client = Client()
+    status = await adapter._handle_c2c(
+        {
+            "id": "batch-limit",
+            "content": "images",
+            "attachments": [
+                {"url": "https://multimedia.nt.qq.com.cn/one"},
+                {"url": "https://multimedia.nt.qq.com.cn/two"},
+            ],
+            "author": {"user_openid": "allowed"},
+        }
+    )
+    assert status is DeliveryStatus.REJECTED
+    assert imported.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stop_with_attachment_rejects_before_download_or_import() -> None:
+    imported = FakeAttachmentImport()
+    adapter = module.build_qqbot_channel(_context(attachment_import=imported))
+    adapter.open_admission()
+
+    class Client:
+        async def get(self, *_args, **_kwargs):
+            raise AssertionError("/stop with attachment must not download")
+
+    adapter._client = Client()
+    status = await adapter._handle_c2c(
+        {
+            "id": "stop-media",
+            "content": "/stop",
+            "attachments": [{"url": "https://multimedia.nt.qq.com.cn/media"}],
+            "author": {"user_openid": "allowed"},
+        }
+    )
+    assert status is DeliveryStatus.REJECTED
+    assert imported.calls == []
+
+
+@pytest.mark.asyncio
+async def test_connection_setup_request_error_is_rejected_without_gateway_exception() -> None:
+    adapter = module.build_qqbot_channel(_context())
+
+    async def request(_method: str, _path: str, _body=None):
+        raise httpx.ConnectError("connect failed")
+
+    adapter._api_request = request
+    status, payload, error = await adapter._request_with_status("POST", "/v2/users/alice/messages")
+    assert status is DeliveryStatus.REJECTED
+    assert payload == {}
+    assert error == "connect failed"
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_blocks_closed_dispatch_and_stop_drains_accepted_work() -> None:
+    adapter = module.build_qqbot_channel(_context())
+    adapter.attach_runtime(SimpleNamespace(binding_token="binding-1"))
+    called = asyncio.Event()
+    released = asyncio.Event()
+
+    async def accepted(_data) -> DeliveryStatus:
+        called.set()
+        await released.wait()
+        return DeliveryStatus.DELIVERED
+
+    adapter._handle_c2c = accepted
+    await adapter._handle_dispatch("C2C_MESSAGE_CREATE", {})
+    assert not called.is_set()
+
+    adapter.open_admission()
+    await adapter._handle_dispatch("C2C_MESSAGE_CREATE", {})
+    await called.wait()
+    adapter.close_admission()
+    stopping = asyncio.create_task(adapter.stop())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    released.set()
+    assert (await stopping).resources_closed
+
+
+@pytest.mark.asyncio
+async def test_opaque_recipient_path_segment_is_rejected_before_provider_effect() -> None:
+    adapter = module.build_qqbot_channel(_context())
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            "binding-1", "invalid-recipient", "c2c:alice/escape", "hello"
+        )
+    )
+    assert receipt.status is DeliveryStatus.REJECTED
 
 
 @pytest.mark.asyncio
