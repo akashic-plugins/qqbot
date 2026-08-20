@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import sys
@@ -11,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
     AttachmentKind,
     AttachmentRef,
     ChannelDeliveryReceipt,
@@ -144,6 +147,58 @@ class FakeTurnStream:
         return self.subscription
 
 
+class FakeAttachmentReadLease:
+    def __init__(self, ref: AttachmentRef, data: bytes) -> None:
+        self.ref = ref
+        self.data = data
+        self.closed = False
+        self.max_bytes: int | None = None
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        self.max_bytes = max_bytes
+        if len(self.data) > max_bytes:
+            raise ValueError("read exceeded bound")
+        return self.data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeAttachmentRead:
+    def __init__(self, values: dict[str, tuple[AttachmentRef, bytes]] | None = None) -> None:
+        self.values = values or {}
+        self.leases: list[FakeAttachmentReadLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> FakeAttachmentReadLease:
+        actual_ref, data = self.values.get(ref.artifact_id, (ref, b""))
+        lease = FakeAttachmentReadLease(actual_ref, data)
+        self.leases.append(lease)
+        return lease
+
+
+class FakeAttachmentImport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, AttachmentKind, str | None, str | None]] = []
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        self.calls.append((data, kind, filename, media_type))
+        return AttachmentRef(
+            artifact_id=f"imported-{len(self.calls)}",
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+            size_bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+
 def _context(
     *,
     factory: FakeProviderFactory | None = None,
@@ -151,6 +206,8 @@ def _context(
     identity: FakeIdentity | None = None,
     control: FakeControl | None = None,
     stream: FakeTurnStream | None = None,
+    attachment_read: FakeAttachmentRead | None = None,
+    attachment_import: FakeAttachmentImport | None = None,
     config: dict[str, object] | None = None,
 ) -> ChannelFactoryContext:
     return ChannelFactoryContext(
@@ -165,6 +222,8 @@ def _context(
         provider_client_factory=factory or FakeProviderFactory(),
         ingress=ingress or FakeIngress(),
         identity=identity or FakeIdentity(),
+        attachment_import=attachment_import or FakeAttachmentImport(),
+        attachment_read=attachment_read or FakeAttachmentRead(),
         control=control or FakeControl(),
         turn_stream=stream or FakeTurnStream(),
     )
@@ -353,17 +412,27 @@ async def test_start_failure_closes_provider_resources_before_reraising() -> Non
 
 
 @pytest.mark.asyncio
-async def test_attachment_is_rejected_before_provider_effect() -> None:
-    factory = FakeProviderFactory()
-    adapter = module.build_qqbot_channel(_context(factory=factory))
+async def test_attachment_delivery_reads_exact_bytes_and_preserves_text_file_order() -> None:
+    data = b"x"
     attachment = AttachmentRef(
         artifact_id="artifact-1",
         kind=AttachmentKind.FILE,
         filename="a.txt",
         media_type="text/plain",
-        size_bytes=1,
-        sha256="0" * 64,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
     )
+    read = FakeAttachmentRead({"artifact-1": (attachment, data)})
+    adapter = module.build_qqbot_channel(_context(attachment_read=read))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def request(method: str, path: str, body: dict[str, object] | None = None):
+        calls.append((path, body or {}))
+        if path.endswith("/files"):
+            return DeliveryStatus.DELIVERED, {"file_info": "file-info"}, None
+        return DeliveryStatus.DELIVERED, {"id": f"provider-{len(calls)}"}, None
+
+    adapter._request_with_status = request
     receipt = await adapter.deliver(
         ProviderDeliveryRequest(
             "binding-1",
@@ -373,8 +442,73 @@ async def test_attachment_is_rejected_before_provider_effect() -> None:
             (attachment,),
         )
     )
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert [path for path, _body in calls] == [
+        "/v2/users/alice/messages",
+        "/v2/users/alice/files",
+        "/v2/users/alice/messages",
+    ]
+    assert calls[1][1]["file_data"] == "eA=="
+    assert calls[2][1] == {"msg_type": 7, "media": {"file_info": "file-info"}, "msg_seq": calls[2][1]["msg_seq"]}
+    assert read.leases[0].max_bytes == 1
+    assert read.leases[0].closed
+
+
+@pytest.mark.asyncio
+async def test_attachment_upload_failure_is_rejected_without_rich_media_message() -> None:
+    data = b"x"
+    attachment = AttachmentRef(
+        artifact_id="artifact-failure",
+        kind=AttachmentKind.FILE,
+        filename="a.txt",
+        media_type="text/plain",
+        size_bytes=1,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    adapter = module.build_qqbot_channel(
+        _context(attachment_read=FakeAttachmentRead({"artifact-failure": (attachment, data)}))
+    )
+    paths: list[str] = []
+
+    async def request(method: str, path: str, body: dict[str, object] | None = None):
+        paths.append(path)
+        if path.endswith("/files"):
+            return DeliveryStatus.REJECTED, {}, "HTTP 400"
+        return DeliveryStatus.DELIVERED, {"id": "text-id"}, None
+
+    adapter._request_with_status = request
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest("binding-1", "delivery-failure", "c2c:alice", "", (attachment,))
+    )
     assert receipt.status is DeliveryStatus.REJECTED
-    assert factory.create_calls == 0
+    assert paths == ["/v2/users/alice/files"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> None:
+    data = b"x"
+    attachment = AttachmentRef(
+        artifact_id="artifact-cancel",
+        kind=AttachmentKind.FILE,
+        filename="a.txt",
+        media_type="text/plain",
+        size_bytes=1,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    read = FakeAttachmentRead({"artifact-cancel": (attachment, data)})
+    adapter = module.build_qqbot_channel(
+        _context(attachment_read=read)
+    )
+
+    async def request(method: str, path: str, body: dict[str, object] | None = None):
+        raise asyncio.CancelledError
+
+    adapter._request_with_status = request
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.deliver(
+            ProviderDeliveryRequest("binding-1", "delivery-cancel", "c2c:alice", "", (attachment,))
+        )
+    assert read.leases[0].closed
 
 
 @pytest.mark.asyncio
@@ -437,9 +571,22 @@ async def test_inbound_is_allowlisted_and_stop_uses_control_port() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inbound_attachment_is_rejected_without_admission() -> None:
+async def test_inbound_attachment_downloads_and_imports_before_admission() -> None:
     ingress = FakeIngress()
     adapter = module.build_qqbot_channel(_context(ingress=ingress))
+
+    class Response:
+        content = b"image-bytes"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class Client:
+        async def get(self, url: str) -> Response:
+            assert url == "https://example.test/image"
+            return Response()
+
+    adapter._client = Client()
 
     status = await adapter._handle_c2c(
         {
@@ -450,8 +597,10 @@ async def test_inbound_attachment_is_rejected_without_admission() -> None:
         }
     )
 
-    assert status is DeliveryStatus.REJECTED
-    assert ingress.raw == []
+    assert status is DeliveryStatus.DELIVERED
+    assert len(ingress.raw) == 1
+    assert ingress.raw[0].message.content == "image"
+    assert ingress.raw[0].message.attachments[0].size_bytes == len(b"image-bytes")
 
 
 @pytest.mark.asyncio

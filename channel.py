@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import mimetypes
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -15,6 +18,8 @@ import httpx
 import websockets
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
     ChannelAdapter,
     ChannelCleanupFailure,
     ChannelFactoryContext,
@@ -51,6 +56,7 @@ _CREDENTIAL_ALIASES = {
     "app_id": ("appId", "app_id"),
     "client_secret": ("clientSecret", "client_secret"),
 }
+_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -178,19 +184,13 @@ class QQBotAdapter:
             raise
 
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
-        """Send one text message and return a settled three-state receipt."""
+        """Read exact Core attachments, send ordered parts, and settle one receipt."""
 
         if not isinstance(request, ProviderDeliveryRequest):
             raise TypeError("QQBot deliver 只接受 ProviderDeliveryRequest")
         if request.binding_token != self._binding_token:
             raise RuntimeError("QQBot delivery binding token 不匹配")
-        if request.attachments:
-            return ProviderDeliveryReceipt(
-                request.delivery_id,
-                DeliveryStatus.REJECTED,
-                error="QQBot v3 首批 adapter 只支持文本，附件未被读取或上传",
-            )
-        if not request.body.strip():
+        if not request.body.strip() and not request.attachments:
             return ProviderDeliveryReceipt(
                 request.delivery_id,
                 DeliveryStatus.REJECTED,
@@ -210,16 +210,132 @@ class QQBotAdapter:
                 DeliveryStatus.REJECTED,
                 error=str(error),
             )
-        status, provider_id, error = await self._send_text(
-            request.recipient,
-            request.body,
-        )
+        # 1. Read and hash-check every Core-owned attachment before provider effect.
+        try:
+            attachment_data = await self._read_attachments(request.attachments)
+        except asyncio.CancelledError:
+            raise
+        except (RuntimeError, TypeError, ValueError) as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error=f"QQBot 附件读取失败: {error}",
+            )
+
+        # 2. Send text first, then media in exact request order.
+        provider_ids: list[str] = []
+        if request.body.strip():
+            status, provider_id, error = await self._send_text(
+                request.recipient,
+                request.body,
+            )
+            if provider_id:
+                provider_ids.append(provider_id)
+            if status is not DeliveryStatus.DELIVERED:
+                if provider_ids and status is DeliveryStatus.REJECTED:
+                    status = DeliveryStatus.UNKNOWN
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    status,
+                    tuple(provider_ids),
+                    error=error,
+                )
+        for ref, data in attachment_data:
+            status, provider_id, error = await self._send_attachment(
+                request.recipient,
+                ref,
+                data,
+            )
+            if provider_id:
+                provider_ids.append(provider_id)
+            if status is not DeliveryStatus.DELIVERED:
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    status,
+                    tuple(provider_ids),
+                    error=error,
+                )
         return ProviderDeliveryReceipt(
             request.delivery_id,
-            status,
-            (provider_id,) if provider_id else (),
-            error=error,
+            DeliveryStatus.DELIVERED,
+            tuple(provider_ids),
         )
+
+    async def _read_attachments(
+        self,
+        refs: tuple[AttachmentRef, ...],
+    ) -> list[tuple[AttachmentRef, bytes]]:
+        """Read and hash-check Core attachments while retaining no path access."""
+
+        if not refs:
+            return []
+        attachment_read = self._context.attachment_read
+        if attachment_read is None:
+            raise RuntimeError("QQBot outbound 附件缺少 Core attachment_read")
+        result: list[tuple[AttachmentRef, bytes]] = []
+        for ref in refs:
+            lease = await attachment_read.acquire(ref)
+            try:
+                if lease.ref != ref:
+                    raise RuntimeError("QQBot attachment read lease ref 不匹配")
+                data = await lease.read_bytes(
+                    max_bytes=min(max(ref.size_bytes, 1), _MAX_ATTACHMENT_BYTES)
+                )
+                if len(data) != ref.size_bytes:
+                    raise ValueError(
+                        f"附件大小不匹配: expected={ref.size_bytes} actual={len(data)}"
+                    )
+                if hashlib.sha256(data).hexdigest() != ref.sha256:
+                    raise ValueError("附件 sha256 不匹配")
+                result.append((ref, data))
+            finally:
+                await _close_attachment_lease(lease)
+        return result
+
+    async def _send_attachment(
+        self,
+        recipient: str,
+        ref: AttachmentRef,
+        data: bytes,
+    ) -> tuple[DeliveryStatus, str | None, str | None]:
+        """Upload one verified attachment and send its rich-media message."""
+
+        _, openid = _parse_recipient(recipient)
+        upload_status, upload_payload, upload_error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/files",
+            {
+                "file_type": 1 if ref.kind is AttachmentKind.IMAGE else 4,
+                "file_data": base64.b64encode(data).decode("ascii"),
+                "srv_send_msg": False,
+                **(
+                    {"file_name": ref.filename}
+                    if ref.kind is AttachmentKind.FILE and ref.filename
+                    else {}
+                ),
+            },
+        )
+        if upload_status is not DeliveryStatus.DELIVERED:
+            return upload_status, None, upload_error
+        file_info = str(upload_payload.get("file_info") or "").strip()
+        if not file_info:
+            return DeliveryStatus.UNKNOWN, None, "QQBot media upload response 缺少 file_info"
+        send_status, send_payload, send_error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/messages",
+            {
+                "msg_type": 7,
+                "media": {"file_info": file_info},
+                "msg_seq": _next_msg_seq(),
+            },
+        )
+        # Upload has already changed provider state; a failed follow-up send is unknown.
+        if send_status is not DeliveryStatus.DELIVERED:
+            return DeliveryStatus.UNKNOWN, None, send_error
+        provider_id = str(send_payload.get("id") or "").strip()
+        if not provider_id:
+            return DeliveryStatus.UNKNOWN, None, "QQBot rich-media response 缺少 message id"
+        return DeliveryStatus.DELIVERED, provider_id, None
 
     async def stop(self) -> StopReceipt:
         """Close gateway, stream subscription, HTTP, and provider resources."""
@@ -387,20 +503,39 @@ class QQBotAdapter:
         openid = raw_openid.strip()
         raw_message_id = data.get("id")
         raw_content = data.get("content")
-        if not isinstance(raw_message_id, str) or not isinstance(raw_content, str):
-            logger.warning("[qqbot] 拒绝非 string identity/message/content")
+        if not isinstance(raw_message_id, str):
+            logger.warning("[qqbot] 拒绝非 string identity/message")
+            return DeliveryStatus.REJECTED
+        if raw_content is not None and not isinstance(raw_content, str):
+            logger.warning("[qqbot] 拒绝非 string content")
             return DeliveryStatus.REJECTED
         message_id = raw_message_id.strip()
-        content = raw_content.strip()
-        if not openid or not message_id or not content:
-            logger.warning("[qqbot] 拒绝缺少 identity/message/content 的私聊事件")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        if not openid or not message_id:
+            logger.warning("[qqbot] 拒绝缺少 identity/message 的私聊事件")
             return DeliveryStatus.REJECTED
         if not self._allow_from or openid not in self._allow_from:
             logger.warning("[qqbot] 拒绝未授权私聊用户 user_openid=%s", openid)
             return DeliveryStatus.REJECTED
-        if _has_provider_attachments(data):
-            logger.info("[qqbot] 拒绝带附件的私聊事件 message_id=%s", message_id)
+        try:
+            provider_attachments = _provider_attachments(data)
+            if provider_attachments is None:
+                raise ValueError("QQBot attachments 字段格式非法")
+            attachments = await self._import_provider_attachments(provider_attachments)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPStatusError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning(
+                "[qqbot] 入站附件未能导入 message_id=%s err=%s",
+                message_id,
+                error,
+            )
             return DeliveryStatus.REJECTED
+        if not content and not attachments:
+            logger.warning("[qqbot] 拒绝缺少 content/attachments 的私聊事件")
+            return DeliveryStatus.REJECTED
+        if not content:
+            content = "[附件]"
         raw = RawInbound(
             message_id=message_id,
             message=ChannelInboundMessage(
@@ -414,6 +549,7 @@ class QQBotAdapter:
                     "user_openid": openid,
                     "message_id": message_id,
                 },
+                attachments=tuple(attachments),
             ),
             provider_identity=openid,
             recipient=f"c2c:{openid}",
@@ -441,6 +577,50 @@ class QQBotAdapter:
             self._message_identities[message_id] = openid
             return DeliveryStatus.DELIVERED
         return DeliveryStatus.REJECTED
+
+    async def _import_provider_attachments(
+        self,
+        provider_attachments: list[Mapping[str, Any]],
+    ) -> list[AttachmentRef]:
+        """Download QQ media URLs and import every byte through Core."""
+
+        if not provider_attachments:
+            return []
+        attachment_import = self._context.attachment_import
+        if attachment_import is None:
+            raise RuntimeError("QQBot 入站附件缺少 Core attachment_import")
+        if self._client is None:
+            raise RuntimeError("QQBot HTTP client 尚未 start")
+        refs: list[AttachmentRef] = []
+        for item in provider_attachments:
+            url = item.get("url") or item.get("resolved_url")
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                raise ValueError("QQBot 入站附件缺少安全下载 URL")
+            declared_size = item.get("size")
+            if isinstance(declared_size, int) and declared_size > _MAX_ATTACHMENT_BYTES:
+                raise ValueError("QQBot 入站附件超过大小上限")
+            response = await self._client.get(url)
+            response.raise_for_status()
+            data = await _bounded_response_bytes(response)
+            filename = item.get("filename")
+            filename = filename.strip() if isinstance(filename, str) and filename.strip() else "attachment"
+            media_type = item.get("content_type")
+            media_type = (
+                media_type.strip()
+                if isinstance(media_type, str) and media_type.strip()
+                else mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+            kind = AttachmentKind.IMAGE if media_type.startswith("image/") else AttachmentKind.FILE
+            ref = await attachment_import.import_bytes(
+                data,
+                kind=kind,
+                filename=filename,
+                media_type=media_type,
+            )
+            if not isinstance(ref, AttachmentRef):
+                raise TypeError("QQBot attachment_import 必须返回 AttachmentRef")
+            refs.append(ref)
+        return refs
 
     async def _on_turn_stream(self, event: TurnStreamEvent) -> PresentationReceipt:
         """Project input notify and temporary stream without replacing final delivery."""
@@ -818,18 +998,35 @@ def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
     return frozenset(item for item in value if item)
 
 
-def _has_provider_attachments(data: Mapping[str, Any]) -> bool:
-    """Reject provider media payloads while the v3 adapter remains text-only."""
+def _provider_attachments(data: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """Normalize QQ provider attachment objects without retaining provider paths."""
 
-    attachments = data.get("attachments")
-    if attachments is not None and (
-        not isinstance(attachments, list) or bool(attachments)
-    ):
-        return True
-    return any(
-        key in data and data[key] not in (None, "", [], {})
-        for key in ("image", "file", "media")
-    )
+    raw = data.get("attachments")
+    if raw is None:
+        aliases: list[Mapping[str, Any]] = []
+        for key in ("image", "file", "media"):
+            value = data.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if not isinstance(value, Mapping):
+                return None
+            aliases.append(value)
+        return aliases
+    if not isinstance(raw, list):
+        return None
+    result: list[Mapping[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return None
+        result.append(item)
+    return result
+
+
+def _has_provider_attachments(data: Mapping[str, Any]) -> bool:
+    """Return whether a provider payload carries a non-empty attachment list."""
+
+    attachments = _provider_attachments(data)
+    return attachments is None or bool(attachments)
 
 
 def _parse_recipient(recipient: str) -> tuple[str, str]:
@@ -854,6 +1051,49 @@ def _tail_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return "..." + text[-(limit - 3) :]
+
+
+async def _close_attachment_lease(lease: Any) -> None:
+    """Finish attachment lease cleanup even when the caller is cancelled."""
+
+    task = asyncio.create_task(lease.aclose(), name="qqbot-attachment-lease-close")
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    if task.cancelled():
+        raise asyncio.CancelledError
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _bounded_response_bytes(response: Any) -> bytes:
+    """Collect a provider response without exceeding the attachment memory bound."""
+
+    chunks: list[bytes] = []
+    total = 0
+    aiter_bytes = getattr(response, "aiter_bytes", None)
+    if callable(aiter_bytes):
+        aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
+        async for chunk in aiter_bytes():
+            if not isinstance(chunk, bytes):
+                raise TypeError("QQBot provider response chunk 必须是 bytes")
+            total += len(chunk)
+            if total > _MAX_ATTACHMENT_BYTES:
+                raise ValueError("QQBot 入站附件超过大小上限")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    data = response.content
+    if not isinstance(data, bytes):
+        raise TypeError("QQBot provider response content 必须是 bytes")
+    if len(data) > _MAX_ATTACHMENT_BYTES:
+        raise ValueError("QQBot 入站附件超过大小上限")
+    return data
 
 
 async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
