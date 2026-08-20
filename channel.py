@@ -180,7 +180,7 @@ class QQBotAdapter:
 
             # 2. Resolve only through the formal provider factory.
             self._provider_client = await self._provider_factory.create(self._credentials)
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
 
             # 3. Attach the exact presentation callback before receiving provider input.
             turn_stream = self._presentation.turn_stream
@@ -708,10 +708,16 @@ class QQBotAdapter:
             raise ValueError("QQBot 入站附件批次超过总大小上限")
         refs: list[AttachmentRef] = []
         downloaded: list[tuple[bytes, AttachmentKind, str, str]] = []
-        actual_total = 0
+        remaining = _MAX_ATTACHMENT_BATCH_BYTES
         for item in provider_attachments:
+            if remaining <= 0:
+                raise ValueError("QQBot 入站附件批次超过总大小上限")
             url = item.get("url") or item.get("resolved_url")
             safe_url = _validate_media_url(url)
+            max_bytes = min(_MAX_ATTACHMENT_BYTES, remaining)
+            declared_size = item.get("size")
+            if isinstance(declared_size, int) and declared_size > max_bytes:
+                raise ValueError("QQBot 入站附件超过剩余批次额度")
             async with self._client.stream(
                 "GET",
                 safe_url,
@@ -720,10 +726,8 @@ class QQBotAdapter:
                 if 300 <= response.status_code < 400:
                     raise ValueError("QQBot 入站附件禁止重定向")
                 response.raise_for_status()
-                data = await _bounded_response_bytes(response)
-            actual_total += len(data)
-            if actual_total > _MAX_ATTACHMENT_BATCH_BYTES:
-                raise ValueError("QQBot 入站附件批次超过总大小上限")
+                data = await _bounded_response_bytes(response, max_bytes=max_bytes)
+            remaining -= len(data)
             filename = item.get("filename")
             filename = filename.strip() if isinstance(filename, str) and filename.strip() else "attachment"
             media_type = item.get("content_type")
@@ -1024,7 +1028,7 @@ class QQBotAdapter:
         try:
             payload = await self._api_request(method, path, body)
         except asyncio.CancelledError:
-            raise
+            return DeliveryStatus.UNKNOWN, {}, "QQBot provider request 被取消，效果未知"
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             delivery = (
@@ -1279,9 +1283,21 @@ async def _close_attachment_lease(lease: Any) -> None:
     return result
 
 
-async def _bounded_response_bytes(response: Any) -> bytes:
+async def _bounded_response_bytes(response: Any, *, max_bytes: int) -> bytes:
     """Collect a provider response without exceeding the attachment memory bound."""
 
+    if max_bytes <= 0 or max_bytes > _MAX_ATTACHMENT_BYTES:
+        raise ValueError("QQBot 入站附件读取额度非法")
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw_length = headers.get("content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except (TypeError, ValueError) as error:
+                raise ValueError("QQBot provider Content-Length 非法") from error
+            if content_length < 0 or content_length > max_bytes:
+                raise ValueError("QQBot 入站附件超过剩余批次额度")
     chunks: list[bytes] = []
     total = 0
     aiter_bytes = getattr(response, "aiter_bytes", None)
@@ -1292,8 +1308,8 @@ async def _bounded_response_bytes(response: Any) -> bytes:
         if not isinstance(chunk, bytes):
             raise TypeError("QQBot provider response chunk 必须是 bytes")
         total += len(chunk)
-        if total > _MAX_ATTACHMENT_BYTES:
-            raise ValueError("QQBot 入站附件超过大小上限")
+        if total > max_bytes:
+            raise ValueError("QQBot 入站附件超过剩余批次额度")
         chunks.append(chunk)
     return b"".join(chunks)
 

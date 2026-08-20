@@ -486,7 +486,7 @@ async def test_attachment_upload_failure_is_rejected_without_rich_media_message(
 
 
 @pytest.mark.asyncio
-async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> None:
+async def test_attachment_delivery_cancel_settles_unknown_and_closes_read_lease() -> None:
     data = b"x"
     attachment = AttachmentRef(
         artifact_id="artifact-cancel",
@@ -501,14 +501,22 @@ async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> 
         _context(attachment_read=read)
     )
 
-    async def request(method: str, path: str, body: dict[str, object] | None = None):
-        raise asyncio.CancelledError
+    started = asyncio.Event()
 
-    adapter._request_with_status = request
-    with pytest.raises(asyncio.CancelledError):
-        await adapter.deliver(
+    async def request(method: str, path: str, body: dict[str, object] | None = None):
+        started.set()
+        await asyncio.Event().wait()
+
+    adapter._api_request = request
+    task = asyncio.create_task(
+        adapter.deliver(
             ProviderDeliveryRequest("binding-1", "delivery-cancel", "c2c:alice", "", (attachment,))
         )
+    )
+    await started.wait()
+    task.cancel()
+    receipt = await task
+    assert receipt.status is DeliveryStatus.UNKNOWN
     assert read.leases[0].closed
 
 
@@ -719,20 +727,28 @@ async def test_inbound_redirect_and_batch_limit_create_no_artifact(
     imported = FakeAttachmentImport()
     adapter = module.build_qqbot_channel(_context(attachment_import=imported))
     adapter.open_admission()
+    streamed: list[tuple[str, bool]] = []
 
     class Response:
-        content = b"xx"
         status_code = 200
+
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.headers = {"content-length": "2"}
 
         def raise_for_status(self) -> None:
             return None
 
         async def aiter_bytes(self):
-            yield self.content
+            streamed.append((self.key, True))
+            yield b"xx"
 
     class Stream:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
         async def __aenter__(self) -> Response:
-            return Response()
+            return Response(self.key)
 
         async def __aexit__(self, *_args) -> None:
             return None
@@ -741,7 +757,9 @@ async def test_inbound_redirect_and_batch_limit_create_no_artifact(
         def stream(self, method: str, url: str, **kwargs) -> Stream:
             assert method == "GET"
             assert kwargs["follow_redirects"] is False
-            return Stream()
+            key = url.rsplit("/", 1)[-1]
+            streamed.append((key, False))
+            return Stream(key)
 
     adapter._client = Client()
     status = await adapter._handle_c2c(
@@ -756,6 +774,7 @@ async def test_inbound_redirect_and_batch_limit_create_no_artifact(
         }
     )
     assert status is DeliveryStatus.REJECTED
+    assert streamed == [("one", False), ("one", True), ("two", False)]
     assert imported.calls == []
 
 
