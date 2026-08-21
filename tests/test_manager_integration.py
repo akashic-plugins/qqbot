@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 
 import pytest
 
 from agent.plugins import channel_generation_host
+from agent.plugin_composition.channels import ChannelAdapter, ChannelFactoryContext
 from agent.plugins.manager import PluginManager
 from bus.event_bus import EventBus
 
@@ -78,13 +81,16 @@ async def test_manager_formal_candidate_discard_promote_and_cleanup(
     factory = FakeProviderFactory()
     original_resolver = channel_generation_host._resolve_sync_factory
 
-    def resolve_factory(module: object, export: str) -> object:
+    def resolve_factory(
+        module: ModuleType,
+        export: str,
+    ) -> Callable[[ChannelFactoryContext], ChannelAdapter]:
         factory_callable = original_resolver(module, export)
 
-        def wrapped(context: object) -> object:
+        def wrapped(context: ChannelFactoryContext) -> ChannelAdapter:
             adapter = cast(Any, factory_callable(context))
             adapter._gateway_loop = lambda: adapter._stopped.wait()
-            return adapter
+            return cast(ChannelAdapter, adapter)
 
         return wrapped
 
