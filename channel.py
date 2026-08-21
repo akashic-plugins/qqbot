@@ -1,579 +1,1071 @@
-"""
-官方 QQBot 通道。
-
-MVP 只支持文本：
-- WebSocket 接收私聊事件
-- REST API 发送私聊 markdown 文本
-- 私聊流式消息可用时走官方 stream_messages
-"""
+"""Pure v3 QQBot protocol adapter."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import mimetypes
 import time
-from dataclasses import dataclass, replace
-from collections.abc import Callable, Coroutine
-from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
+from collections.abc import AsyncIterable, Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, cast
 
 import httpx
 import websockets
 
-from agent.looping.interrupt import InterruptController
-from bus.events import (
-    ChannelMessage,
-    DeliveryReceipt,
-    InboundMessage,
-    OutboundMessage,
-    channel_message_from_outbound,
+from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
+    ChannelAdapter,
+    ChannelCleanupFailure,
+    ChannelFactoryContext,
+    ChannelInboundMessage,
+    ChannelPresentationPorts,
+    ChannelReady,
+    ControlResponseBodies,
+    CredentialRef,
+    DeliveryStatus,
+    PresentationReceipt,
+    ProviderDeliveryReceipt,
+    ProviderDeliveryRequest,
+    RawInbound,
+    StopReceipt,
+    StreamDeltaPresentation,
+    TurnOutputCompletedPresentation,
+    TurnStartedPresentation,
+    TurnStreamEvent,
+    TurnStreamEventKind,
 )
-from bus.events_lifecycle import StreamDeltaReady, TurnStarted
-from bus.queue import MessageBus
-from infra.channels.contract import ChannelContext
-from infra.channels.delivery import deliver_message_parts
 
-if TYPE_CHECKING:
-    from .plugin import QQBotGroupConfigModel
 
 logger = logging.getLogger(__name__)
 
 _CHANNEL = "qqbot"
 _API_BASE = "https://api.sgroup.qq.com"
 _TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
+_REJECTED_HTTP_STATUSES = frozenset({400, 401, 403, 404, 405, 413, 415, 422})
 _LIVE_STREAM_MIN_CHARS = 120
 _LIVE_STREAM_MIN_INTERVAL_S = 1.5
 _LIVE_MAX_FAILURES = 3
 _REPLY_LIVE_TAIL = 900
+_CREDENTIAL_ALIASES = {
+    "app_id": ("appId", "app_id"),
+    "client_secret": ("clientSecret", "client_secret"),
+}
+_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_MAX_ATTACHMENT_COUNT = 16
+_MAX_ATTACHMENT_BATCH_BYTES = 100 * 1024 * 1024
+_MAX_PROVIDER_SEGMENT_LENGTH = 256
+_QQ_MEDIA_HOSTS = frozenset({"multimedia.nt.qq.com.cn"})
 
 
-@dataclass
+@dataclass(slots=True)
 class _TokenCache:
     token: str
     expires_at: float
 
 
-@dataclass
+@dataclass(slots=True)
 class _LiveStreamState:
     openid: str
     msg_id: str
     msg_seq: int
     stream_msg_id: str = ""
     index: int = 0
-    completed: bool = False
 
 
-class QQBotChannel:
+def build_qqbot_channel(context: ChannelFactoryContext) -> ChannelAdapter:
+    """Build a side-effect-free QQBot adapter for one exact binding."""
+
+    if not isinstance(context, ChannelFactoryContext):
+        raise TypeError("QQBot channel factory 只接受 ChannelFactoryContext")
+    if context.ingress is None or context.identity is None:
+        raise RuntimeError("QQBot v3 channel 需要 Core ingress/identity ports")
+    if context.control is None or context.turn_stream is None:
+        raise RuntimeError("QQBot v3 channel 需要 Core control/turn-stream ports")
+    return QQBotAdapter(context)
+
+
+class QQBotAdapter:
+    """Translate QQBot text, control, delivery, and preview events to C14 ports."""
+
     name = _CHANNEL
 
-    def __init__(
-        self,
-        app_id: str,
-        client_secret: str,
-        allow_from: list[str] | None = None,
-        groups: list["QQBotGroupConfigModel"] | None = None,
-    ) -> None:
-        self._app_id = app_id
-        self._client_secret = client_secret
-        self._bus: MessageBus | None = None
-        self._allow_from = set(allow_from or [])
-        self._groups: dict[str, QQBotGroupConfigModel] = {
-            g.group_openid: g for g in (groups or [])
-        }
-        self._interrupt_controller: InterruptController | None = None
-        self._client = httpx.AsyncClient(timeout=30.0)
+    def __init__(self, context: ChannelFactoryContext) -> None:
+        self._context = context
+        self._identity = context.identity
+        self._ingress = context.ingress
+        self._provider_factory = context.provider_client_factory
+        self._credentials = context.credentials
+        self._config = context.config
+        self._binding_token = context.binding_token
+        self._allow_from = _allow_from(self._config)
+
+        self._presentation: ChannelPresentationPorts | None = None
+        self._stream_subscription: Any | None = None
+        self._provider_client: Any | None = None
+        self._client: httpx.AsyncClient | None = None
         self._token: _TokenCache | None = None
-        self._task: asyncio.Task[None] | None = None
-        self._outbound_bound = False
-        self._events_bound = False
+        self._gateway_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[StopReceipt] | None = None
         self._stopped = asyncio.Event()
-        self._last_c2c_msg_id: dict[str, str] = {}
-        self._live_states: dict[str, _LiveStreamState] = {}
+        self._started = False
+        self._stopping = False
+        self._admission_open = False
+        self._runtime: Any | None = None
+        self._inbound_tasks: set[asyncio.Task[DeliveryStatus]] = set()
+
+        self._message_recipients: dict[str, str] = {}
+        self._message_identities: dict[str, str] = {}
+        self._presentation_recipients: dict[str, str] = {}
+        self._presentation_message_ids: dict[str, str] = {}
         self._reply_buffers: dict[str, str] = {}
+        self._live_states: dict[str, _LiveStreamState] = {}
         self._live_next_at: dict[str, float] = {}
         self._live_last_lengths: dict[str, int] = {}
         self._live_failures: dict[str, int] = {}
         self._live_disabled: set[str] = set()
+        self._live_uncertain: set[str] = set()
         self._live_locks: dict[str, asyncio.Lock] = {}
-        self._live_tasks: set[asyncio.Task[None]] = set()
-        self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
 
-    async def start(self, ctx: ChannelContext) -> None:
-        if self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
-        self._bus = ctx.bus
-        self._interrupt_controller = ctx.interrupt_controller
-        if not self._events_bound:
-            ctx.event_bus.on(TurnStarted, self._on_turn_started)
-            ctx.event_bus.on(StreamDeltaReady, self._on_stream_delta)
-            self._events_bound = True
-        ctx.push_tool.register_channel(
-            self.name,
-            deliver=self._deliver_message,
+    def attach_presentation(self, ports: ChannelPresentationPorts) -> None:
+        """Bind exact control and turn-stream facades before start."""
+
+        if self._presentation is not None:
+            raise RuntimeError("QQBot presentation ports 不能重复绑定")
+        if ports.control is None or ports.turn_stream is None:
+            raise RuntimeError("QQBot v3 必须同时绑定 control 与 turn_stream")
+        self._presentation = ports
+
+    def attach_runtime(self, runtime: Any) -> None:
+        """Bind the exact Host runtime lifecycle owner without replacing context ports."""
+
+        if self._runtime is not None:
+            raise RuntimeError("QQBot runtime 不能重复绑定")
+        if runtime is None:
+            raise TypeError("QQBot runtime 不能为空")
+        if getattr(runtime, "binding_token", None) != self._binding_token:
+            raise RuntimeError("QQBot runtime binding token 不匹配")
+        self._runtime = runtime
+
+    def open_admission(self) -> None:
+        """Allow provider ingress only after Core has published this binding."""
+
+        if self._stopping:
+            raise RuntimeError("QQBot adapter 正在停止")
+        self._admission_open = True
+
+    def close_admission(self) -> None:
+        """Reject new provider ingress while accepted gateway work drains."""
+
+        self._admission_open = False
+
+    async def start(self) -> ChannelReady:
+        """Create formal provider resources and start the gateway closed."""
+
+        if self._started or self._stopping:
+            raise RuntimeError("QQBot adapter 已启动或正在停止")
+        if self._presentation is None:
+            raise RuntimeError("QQBot adapter 缺少 presentation ports")
+
+        try:
+            # 1. Validate both credential identities before acquiring any resource.
+            self._credential_ref("app_id")
+            self._credential_ref("client_secret")
+
+            # 2. Resolve only through the formal provider factory.
+            self._provider_client = await self._provider_factory.create(self._credentials)
+            self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+
+            # 3. Attach the exact presentation callback before receiving provider input.
+            turn_stream = self._presentation.turn_stream
+            if turn_stream is None:
+                raise RuntimeError("QQBot turn stream port 未绑定")
+            self._stream_subscription = turn_stream.subscribe(self._on_turn_stream)
+            self._stopped.clear()
+            self._gateway_task = asyncio.create_task(
+                self._gateway_loop(),
+                name=f"qqbot-gateway:{self._context.generation_id}",
+            )
+            self._started = True
+            return ChannelReady(
+                self._binding_token,
+                subscriptions=("qqbot.gateway", "qqbot.turn_stream"),
+                admission_open=False,
+            )
+        except BaseException as error:
+            cleanup = await _await_task_after_cancellation(
+                asyncio.create_task(
+                    self._stop_impl(),
+                    name=f"qqbot-start-cleanup:{self._context.generation_id}",
+                )
+            )
+            if cleanup.failures:
+                error.add_note(
+                    "QQBot start cleanup failed: "
+                    + "; ".join(
+                        f"{item.resource}: {item.message}" for item in cleanup.failures
+                    )
+                )
+            raise
+
+    async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
+        """Read exact Core attachments, send ordered parts, and settle one receipt."""
+
+        if not isinstance(request, ProviderDeliveryRequest):
+            raise TypeError("QQBot deliver 只接受 ProviderDeliveryRequest")
+        if request.binding_token != self._binding_token:
+            raise RuntimeError("QQBot delivery binding token 不匹配")
+        if not request.body.strip() and not request.attachments:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot 空消息被拒绝",
+            )
+        if not isinstance(request.recipient, str):
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot recipient 必须是字符串",
+            )
+        try:
+            _parse_recipient(request.recipient)
+        except ValueError as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error=str(error),
+            )
+        # 1. Read and hash-check every Core-owned attachment before provider effect.
+        try:
+            attachment_data = await self._read_attachments(request.attachments)
+        except asyncio.CancelledError:
+            raise
+        except (RuntimeError, TypeError, ValueError) as error:
+            return ProviderDeliveryReceipt(
+                request.delivery_id,
+                DeliveryStatus.REJECTED,
+                error=f"QQBot 附件读取失败: {error}",
+            )
+
+        # 2. Send text first, then media in exact request order.
+        provider_ids: list[str] = []
+        delivered_any = False
+        if request.body.strip():
+            status, provider_id, error = await self._send_text(
+                request.recipient,
+                request.body,
+            )
+            if provider_id:
+                provider_ids.append(provider_id)
+            if status is DeliveryStatus.DELIVERED:
+                delivered_any = True
+            if status is not DeliveryStatus.DELIVERED:
+                if delivered_any and status is DeliveryStatus.REJECTED:
+                    status = DeliveryStatus.UNKNOWN
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    status,
+                    tuple(provider_ids),
+                    error=error,
+                )
+        for ref, data in attachment_data:
+            status, provider_id, error = await self._send_attachment(
+                request.recipient,
+                ref,
+                data,
+            )
+            if provider_id:
+                provider_ids.append(provider_id)
+            if status is DeliveryStatus.DELIVERED:
+                delivered_any = True
+            if status is not DeliveryStatus.DELIVERED:
+                if delivered_any and status is DeliveryStatus.REJECTED:
+                    status = DeliveryStatus.UNKNOWN
+                return ProviderDeliveryReceipt(
+                    request.delivery_id,
+                    status,
+                    tuple(provider_ids),
+                    error=error,
+                )
+        return ProviderDeliveryReceipt(
+            request.delivery_id,
+            DeliveryStatus.DELIVERED,
+            tuple(provider_ids),
         )
-        self._stopped.clear()
-        self._task = asyncio.create_task(self._gateway_loop())
-        if not self._outbound_bound:
-            ctx.bus.subscribe_outbound(_CHANNEL, self._on_response)
-            self._outbound_bound = True
-        logger.info("[qqbot] 官方 QQBot 通道已启动")
 
-    async def stop(self) -> None:
-        self._stopped.set()
-        if self._task:
-            _ = self._task.cancel()
+    async def _read_attachments(
+        self,
+        refs: tuple[AttachmentRef, ...],
+    ) -> list[tuple[AttachmentRef, bytes]]:
+        """Read and hash-check Core attachments while retaining no path access."""
+
+        if not refs:
+            return []
+        if len(refs) > _MAX_ATTACHMENT_COUNT:
+            raise ValueError("QQBot 附件数量超过上限")
+        declared_total = sum(ref.size_bytes for ref in refs)
+        if declared_total > _MAX_ATTACHMENT_BATCH_BYTES:
+            raise ValueError("QQBot 附件批次超过总大小上限")
+        attachment_read = self._context.attachment_read
+        if attachment_read is None:
+            raise RuntimeError("QQBot outbound 附件缺少 Core attachment_read")
+        result: list[tuple[AttachmentRef, bytes]] = []
+        actual_total = 0
+        for ref in refs:
+            lease = await attachment_read.acquire(ref)
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        await self._drain_live_tasks()
-        await self._client.aclose()
-        self._events_bound = False
-        self._outbound_bound = False
-        logger.info("[qqbot] 官方 QQBot 通道已停止")
+                if lease.ref != ref:
+                    raise RuntimeError("QQBot attachment read lease ref 不匹配")
+                data = await lease.read_bytes(
+                    max_bytes=min(max(ref.size_bytes, 1), _MAX_ATTACHMENT_BYTES)
+                )
+                if len(data) != ref.size_bytes:
+                    raise ValueError(
+                        f"附件大小不匹配: expected={ref.size_bytes} actual={len(data)}"
+                    )
+                if hashlib.sha256(data).hexdigest() != ref.sha256:
+                    raise ValueError("附件 sha256 不匹配")
+                actual_total += len(data)
+                if actual_total > _MAX_ATTACHMENT_BATCH_BYTES:
+                    raise ValueError("QQBot 附件批次超过总大小上限")
+                result.append((ref, data))
+            finally:
+                await _close_attachment_lease(lease)
+        return result
 
-    def _require_bus(self) -> MessageBus:
-        if self._bus is None:
-            raise RuntimeError("QQBotChannel 尚未启动")
-        return self._bus
+    async def _send_attachment(
+        self,
+        recipient: str,
+        ref: AttachmentRef,
+        data: bytes,
+    ) -> tuple[DeliveryStatus, str | None, str | None]:
+        """Upload one verified attachment and send its rich-media message."""
+
+        _, openid = _parse_recipient(recipient)
+        upload_status, upload_payload, upload_error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/files",
+            {
+                "file_type": 1 if ref.kind is AttachmentKind.IMAGE else 4,
+                "file_data": base64.b64encode(data).decode("ascii"),
+                "srv_send_msg": False,
+                **(
+                    {"file_name": ref.filename}
+                    if ref.kind is AttachmentKind.FILE and ref.filename
+                    else {}
+                ),
+            },
+        )
+        if upload_status is not DeliveryStatus.DELIVERED:
+            return upload_status, None, upload_error
+        file_info = str(upload_payload.get("file_info") or "").strip()
+        if not file_info:
+            return DeliveryStatus.UNKNOWN, None, "QQBot media upload response 缺少 file_info"
+        try:
+            _provider_segment(file_info, "QQBot file_info")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
+        send_status, send_payload, send_error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/messages",
+            {
+                "msg_type": 7,
+                "media": {"file_info": file_info},
+                "msg_seq": _next_msg_seq(),
+            },
+        )
+        # Upload has already changed provider state; a failed follow-up send is unknown.
+        if send_status is not DeliveryStatus.DELIVERED:
+            return DeliveryStatus.UNKNOWN, None, send_error
+        provider_id = str(send_payload.get("id") or "").strip()
+        if not provider_id:
+            return DeliveryStatus.UNKNOWN, None, "QQBot rich-media response 缺少 message id"
+        try:
+            _provider_segment(provider_id, "QQBot message_id")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
+        return DeliveryStatus.DELIVERED, provider_id, None
+
+    async def stop(self) -> StopReceipt:
+        """Close gateway, stream subscription, HTTP, and provider resources."""
+
+        task = self._stop_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._stop_impl(),
+                name=f"qqbot-stop:{self._context.generation_id}",
+            )
+            self._stop_task = task
+        return await _await_task_after_cancellation(task)
+
+    async def _stop_impl(self) -> StopReceipt:
+        """Close every owned resource and retain failed owners for retry."""
+
+        self._stopping = True
+        self._admission_open = False
+        failures: list[ChannelCleanupFailure] = []
+
+        # 1. Close callback admission before provider resources.
+        subscription = self._stream_subscription
+        if subscription is not None:
+            try:
+                subscription.close_admission()
+                await subscription.await_quiescence()
+                await subscription.close()
+                self._stream_subscription = None
+            except BaseException as error:
+                failures.append(self._cleanup_failure("turn-stream", error))
+
+        # 2. Stop the receive loop and drain its heartbeat child.
+        self._stopped.set()
+        gateway = self._gateway_task
+        if gateway is not None:
+            gateway.cancel()
+            result = await asyncio.gather(gateway, return_exceptions=True)
+            error = result[0]
+            if isinstance(error, BaseException) and not isinstance(
+                error, asyncio.CancelledError
+            ):
+                failures.append(self._cleanup_failure("gateway", error))
+            else:
+                self._gateway_task = None
+
+        # 3. Let callbacks admitted before close settle before releasing Core ports.
+        tasks = tuple(self._inbound_tasks)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    failures.append(self._cleanup_failure("inbound-task", result))
+        self._inbound_tasks.clear()
+
+        # 4. Release formal clients; failed owners remain for exact retry.
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except BaseException as error:
+                failures.append(self._cleanup_failure("http-client", error))
+            else:
+                self._client = None
+        if self._provider_client is not None:
+            try:
+                await self._provider_client.aclose()
+            except BaseException as error:
+                failures.append(self._cleanup_failure("provider-client", error))
+            else:
+                self._provider_client = None
+
+        self._token = None
+        self._admission_open = False
+        if failures:
+            return StopReceipt(self._binding_token, False, tuple(failures))
+        self._started = False
+        self._stopping = False
+        self._clear_presentations()
+        return StopReceipt(self._binding_token, True)
 
     async def _gateway_loop(self) -> None:
+        """Reconnect the external gateway until Core stops this exact binding."""
+
         while not self._stopped.is_set():
             try:
                 token = await self._get_access_token()
                 gateway = await self._api_request("GET", "/gateway", token=token)
-                url = str(gateway["url"])
-                await self._run_gateway(url, token)
+                await self._run_gateway(str(gateway["url"]), token)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                logger.warning("[qqbot] gateway 连接失败: %s", e)
+            except Exception as error:
+                logger.warning("[qqbot] gateway 连接失败: %s", error)
                 await asyncio.sleep(5)
 
     async def _run_gateway(self, url: str, token: str) -> None:
         last_seq: int | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         try:
-            async with websockets.connect(url) as ws:
-                async for raw in ws:
+            async with websockets.connect(url) as websocket:
+                async for raw in websocket:
                     payload = json.loads(raw)
-                    op = payload.get("op")
+                    if not isinstance(payload, dict):
+                        logger.warning("[qqbot] 拒绝非 object gateway payload")
+                        continue
                     raw_data = payload.get("d")
-                    data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
-                    event_type = payload.get("t")
+                    if not isinstance(raw_data, dict):
+                        logger.warning("[qqbot] 拒绝非 object gateway data")
+                        continue
+                    data = cast(dict[str, Any], raw_data)
                     if isinstance(payload.get("s"), int):
                         last_seq = int(payload["s"])
-
-                    if op == 10:
-                        heartbeat_ms = int(data["heartbeat_interval"])
-                        await ws.send(json.dumps({
-                            "op": 2,
-                            "d": {
-                                "token": f"QQBot {token}",
-                                "intents": self._intents(),
-                                "shard": [0, 1],
-                            },
-                        }))
+                    if payload.get("op") == 10:
+                        await websocket.send(
+                            json.dumps(
+                                {
+                                    "op": 2,
+                                    "d": {
+                                        "token": f"QQBot {token}",
+                                        "intents": 1 << 25,
+                                        "shard": [0, 1],
+                                    },
+                                }
+                            )
+                        )
                         if heartbeat_task is not None:
-                            _ = heartbeat_task.cancel()
+                            heartbeat_task.cancel()
                             await asyncio.gather(heartbeat_task, return_exceptions=True)
                         heartbeat_task = asyncio.create_task(
-                            self._heartbeat(ws, heartbeat_ms, lambda: last_seq)
+                            self._heartbeat(
+                                websocket,
+                                int(data["heartbeat_interval"]),
+                                lambda: last_seq,
+                            )
                         )
-                    elif op == 0:
-                        await self._handle_dispatch(str(event_type), data)
-                    elif op == 7:
+                    elif payload.get("op") == 0:
+                        await self._handle_dispatch(str(payload.get("t") or ""), data)
+                    elif payload.get("op") == 7:
                         break
         finally:
             if heartbeat_task is not None:
-                _ = heartbeat_task.cancel()
+                heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     async def _heartbeat(
         self,
-        ws: Any,
+        websocket: Any,
         heartbeat_ms: int,
-        seq_fn: Callable[[], int | None],
+        sequence: Callable[[], int | None],
     ) -> None:
         while True:
             await asyncio.sleep(max(1, heartbeat_ms / 1000))
-            await ws.send(json.dumps({"op": 1, "d": seq_fn()}))
-
-    def _intents(self) -> int:
-        return 1 << 25
+            await websocket.send(json.dumps({"op": 1, "d": sequence()}))
 
     async def _handle_dispatch(self, event_type: str, data: dict[str, Any]) -> None:
         if event_type == "C2C_MESSAGE_CREATE":
-            await self._handle_c2c(data)
+            if not self._admission_open:
+                logger.warning("[qqbot] Core admission 尚未打开，拒绝 provider 入站")
+                return
+            task = asyncio.create_task(
+                self._handle_c2c(data),
+                name=f"qqbot-inbound:{self._context.generation_id}",
+            )
+            self._inbound_tasks.add(task)
+            task.add_done_callback(self._inbound_tasks.discard)
         elif event_type.startswith("GROUP_"):
             logger.debug("[qqbot] 当前仅启用私聊模式，忽略群事件 event=%s", event_type)
 
-    async def _handle_c2c(self, data: dict[str, Any]) -> None:
-        author = _as_dict(data.get("author"))
-        user_openid = str(author.get("user_openid") or data.get("user_openid") or "")
-        if not user_openid:
-            return
-        if self._allow_from and user_openid not in self._allow_from:
-            logger.warning("[qqbot] 拒绝未授权私聊用户 user_openid=%s", user_openid)
-            return
-        content = str(data.get("content") or "").strip()
-        message_id = str(data.get("id") or "")
-        if message_id:
-            self._last_c2c_msg_id[user_openid] = message_id
-            await self._send_input_notify(user_openid, message_id)
-        logger.info("[qqbot] 收到私聊消息 user_openid=%s msg_id=%s", user_openid, message_id)
-        if content == "/stop":
-            await self._handle_stop(f"c2c:{user_openid}", user_openid)
-            return
-        await self._require_bus().publish_inbound(
-            InboundMessage(
+    async def _handle_c2c(self, data: dict[str, Any]) -> DeliveryStatus:
+        if not self._admission_open:
+            logger.warning("[qqbot] Core admission 尚未打开，拒绝 provider 入站")
+            return DeliveryStatus.REJECTED
+        if not isinstance(data, dict):
+            logger.warning("[qqbot] 拒绝非 object 私聊 data")
+            return DeliveryStatus.REJECTED
+        raw_author = data.get("author")
+        if raw_author is not None and not isinstance(raw_author, dict):
+            logger.warning("[qqbot] 拒绝非 object 私聊 author")
+            return DeliveryStatus.REJECTED
+        author = raw_author if isinstance(raw_author, dict) else {}
+        raw_openid = (
+            author["user_openid"]
+            if "user_openid" in author
+            else data.get("user_openid")
+        )
+        if not isinstance(raw_openid, str):
+            logger.warning("[qqbot] 拒绝非 string user_openid")
+            return DeliveryStatus.REJECTED
+        try:
+            _provider_segment(raw_openid, "QQBot user_openid")
+        except ValueError as error:
+            logger.warning("[qqbot] 拒绝非法 user_openid: %s", error)
+            return DeliveryStatus.REJECTED
+        openid = raw_openid
+        raw_message_id = data.get("id")
+        raw_content = data.get("content")
+        if not isinstance(raw_message_id, str):
+            logger.warning("[qqbot] 拒绝非 string identity/message")
+            return DeliveryStatus.REJECTED
+        if raw_content is not None and not isinstance(raw_content, str):
+            logger.warning("[qqbot] 拒绝非 string content")
+            return DeliveryStatus.REJECTED
+        try:
+            _provider_segment(raw_message_id, "QQBot message_id")
+        except ValueError as error:
+            logger.warning("[qqbot] 拒绝非法 message_id: %s", error)
+            return DeliveryStatus.REJECTED
+        message_id = raw_message_id
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        if not openid or not message_id:
+            logger.warning("[qqbot] 拒绝缺少 identity/message 的私聊事件")
+            return DeliveryStatus.REJECTED
+        if not self._allow_from or openid not in self._allow_from:
+            logger.warning("[qqbot] 拒绝未授权私聊用户 user_openid=%s", openid)
+            return DeliveryStatus.REJECTED
+        try:
+            provider_attachments = _provider_attachments(data)
+            if provider_attachments is None:
+                raise ValueError("QQBot attachments 字段格式非法")
+            # /stop is decided before any provider URL is fetched or imported.
+            if content == "/stop":
+                if provider_attachments:
+                    logger.warning("[qqbot] 拒绝带附件的 /stop message_id=%s", message_id)
+                    return DeliveryStatus.REJECTED
+                attachments: list[AttachmentRef] = []
+            else:
+                attachments = await self._import_provider_attachments(provider_attachments)
+        except asyncio.CancelledError:
+            raise
+        except (
+            httpx.HTTPStatusError,
+            httpx.RequestError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            logger.warning(
+                "[qqbot] 入站附件未能导入 message_id=%s err=%s",
+                message_id,
+                error,
+            )
+            return DeliveryStatus.REJECTED
+        if not content and not attachments:
+            logger.warning("[qqbot] 拒绝缺少 content/attachments 的私聊事件")
+            return DeliveryStatus.REJECTED
+        if not content:
+            content = "[附件]"
+        raw = RawInbound(
+            message_id=message_id,
+            message=ChannelInboundMessage(
                 channel=_CHANNEL,
-                sender=user_openid,
-                chat_id=f"c2c:{user_openid}",
+                sender=openid,
+                chat_id=f"c2c:{openid}",
                 content=content,
+                timestamp=datetime.now(timezone.utc),
                 metadata={
                     "chat_type": "private",
-                    "user_openid": user_openid,
+                    "user_openid": openid,
                     "message_id": message_id,
                 },
+                attachments=tuple(attachments),
+            ),
+            provider_identity=openid,
+            recipient=f"c2c:{openid}",
+        )
+        if content == "/stop":
+            presentation = self._require_presentation()
+            control = presentation.control
+            if control is None:
+                raise RuntimeError("QQBot control port 未绑定")
+            result = await control.interrupt(
+                raw,
+                response_bodies=ControlResponseBodies(
+                    interrupted="已停止当前回复。",
+                    idle="当前没有正在进行的回复。",
+                ),
             )
-        )
+            if result.response is None:
+                return DeliveryStatus.REJECTED
+            return result.response.status
+        ingress = self._ingress
+        if ingress is None:
+            raise RuntimeError("QQBot ingress port 未绑定")
+        if await ingress.admit(raw):
+            self._message_recipients[message_id] = f"c2c:{openid}"
+            self._message_identities[message_id] = openid
+            return DeliveryStatus.DELIVERED
+        return DeliveryStatus.REJECTED
 
-    async def _handle_stop(self, chat_id: str, sender: str) -> None:
-        if self._interrupt_controller is None:
-            await self.send(chat_id, "当前未启用中断功能。")
-            return
-        result = self._interrupt_controller.request_interrupt(
-            session_key=f"{_CHANNEL}:{chat_id}",
-            sender=sender,
-            command="/stop",
-        )
-        await self.send(chat_id, result.message)
+    async def _import_provider_attachments(
+        self,
+        provider_attachments: list[Mapping[str, Any]],
+    ) -> list[AttachmentRef]:
+        """Download QQ media URLs and import every byte through Core."""
 
-    async def _on_response(self, msg: OutboundMessage) -> None:
-        session_key = f"{_CHANNEL}:{msg.chat_id}"
-        content = msg.content.strip()
-        sent_as_stream = False
-        if session_key in self._live_states:
-            await self._cancel_live_tasks(session_key)
-            if content:
-                sent_as_stream = await self._send_live_stream(
-                    session_key,
-                    msg.chat_id,
-                    content,
-                    terminal=True,
+        if not provider_attachments:
+            return []
+        attachment_import = self._context.attachment_import
+        if attachment_import is None:
+            raise RuntimeError("QQBot 入站附件缺少 Core attachment_import")
+        if self._client is None:
+            raise RuntimeError("QQBot HTTP client 尚未 start")
+        if len(provider_attachments) > _MAX_ATTACHMENT_COUNT:
+            raise ValueError("QQBot 入站附件数量超过上限")
+        declared_total = 0
+        for item in provider_attachments:
+            declared_size = item.get("size")
+            if isinstance(declared_size, bool):
+                raise ValueError("QQBot 入站附件 size 格式非法")
+            if isinstance(declared_size, int):
+                if declared_size < 0 or declared_size > _MAX_ATTACHMENT_BYTES:
+                    raise ValueError("QQBot 入站附件 size 超过单文件上限")
+                declared_total += declared_size
+        if declared_total > _MAX_ATTACHMENT_BATCH_BYTES:
+            raise ValueError("QQBot 入站附件批次超过总大小上限")
+        refs: list[AttachmentRef] = []
+        downloaded: list[tuple[bytes, AttachmentKind, str, str]] = []
+        remaining = _MAX_ATTACHMENT_BATCH_BYTES
+        for item in provider_attachments:
+            if remaining <= 0:
+                raise ValueError("QQBot 入站附件批次超过总大小上限")
+            url = item.get("url") or item.get("resolved_url")
+            safe_url = _validate_media_url(url)
+            max_bytes = min(_MAX_ATTACHMENT_BYTES, remaining)
+            declared_size = item.get("size")
+            if isinstance(declared_size, int) and declared_size > max_bytes:
+                raise ValueError("QQBot 入站附件超过剩余批次额度")
+            async with self._client.stream(
+                "GET",
+                safe_url,
+                follow_redirects=False,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise ValueError("QQBot 入站附件禁止重定向")
+                response.raise_for_status()
+                data = await _bounded_response_bytes(response, max_bytes=max_bytes)
+            remaining -= len(data)
+            filename = item.get("filename")
+            filename = filename.strip() if isinstance(filename, str) and filename.strip() else "attachment"
+            media_type = item.get("content_type")
+            media_type = (
+                media_type.strip()
+                if isinstance(media_type, str) and media_type.strip()
+                else mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+            kind = AttachmentKind.IMAGE if media_type.startswith("image/") else AttachmentKind.FILE
+            downloaded.append((data, kind, filename, media_type))
+        for data, kind, filename, media_type in downloaded:
+            ref = await attachment_import.import_bytes(
+                data, kind=kind, filename=filename, media_type=media_type
+            )
+            if not isinstance(ref, AttachmentRef):
+                raise TypeError("QQBot attachment_import 必须返回 AttachmentRef")
+            refs.append(ref)
+        return refs
+
+    async def _on_turn_stream(self, event: TurnStreamEvent) -> PresentationReceipt:
+        """Project input notify and temporary stream without replacing final delivery."""
+
+        if event.kind is TurnStreamEventKind.TURN_STARTED:
+            payload = cast(TurnStartedPresentation, event.payload)
+            recipient = self._message_recipients.pop(payload.client_message_id, None)
+            provider_identity = self._message_identities.pop(
+                payload.client_message_id,
+                None,
+            )
+            if recipient is None and provider_identity is not None:
+                identity = self._identity
+                if identity is None:
+                    raise RuntimeError("QQBot identity port 未绑定")
+                recipient = identity.resolve(provider_identity)
+            if recipient is None:
+                self._live_disabled.add(event.presentation_id)
+                return PresentationReceipt(
+                    event.presentation_id,
+                    DeliveryStatus.REJECTED,
+                    error="QQBot turn 缺少 accepted provider message identity",
                 )
-            else:
-                await self._delete_live_preview(session_key)
-            self._clear_live_session(session_key)
-        outbound = channel_message_from_outbound(msg)
-        if sent_as_stream:
-            outbound = replace(outbound, content="")
-        receipt = await self._deliver_message(outbound)
-        if not receipt.succeeded:
-            raise RuntimeError(receipt.detail or "QQBot 消息提交失败")
+            self._presentation_recipients[event.presentation_id] = recipient
+            self._presentation_message_ids[event.presentation_id] = payload.client_message_id
+            status, provider_id, error = await self._send_input_notify(
+                recipient,
+                payload.client_message_id,
+            )
+            if status is DeliveryStatus.UNKNOWN:
+                self._live_uncertain.add(event.presentation_id)
+                self._live_disabled.add(event.presentation_id)
+            elif status is DeliveryStatus.REJECTED:
+                self._live_disabled.add(event.presentation_id)
+            return PresentationReceipt(
+                event.presentation_id,
+                status,
+                (provider_id,) if provider_id else (),
+                error,
+            )
+        if event.kind is TurnStreamEventKind.STREAM_DELTA:
+            payload = cast(StreamDeltaPresentation, event.payload)
+            reply = self._reply_buffers.get(event.presentation_id, "")
+            self._reply_buffers[event.presentation_id] = reply + payload.text_delta
+            return await self._refresh_preview(event.presentation_id)
+        if event.kind is TurnStreamEventKind.TURN_OUTPUT_COMPLETED:
+            _ = cast(TurnOutputCompletedPresentation, event.payload)
+            return await self._finish_preview(event.presentation_id)
+        return PresentationReceipt(event.presentation_id, DeliveryStatus.DELIVERED)
 
-    async def send_proactive(self, chat_id: str, message: str) -> None:
-        kind, _target = self._parse_chat_id(chat_id)
-        if kind != "c2c":
-            raise ValueError("当前 QQBotChannel 仅支持私聊 c2c")
-        await self.send(chat_id, message)
+    async def _refresh_preview(self, presentation_id: str) -> PresentationReceipt:
+        if presentation_id in self._live_uncertain:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.UNKNOWN,
+                error="QQBot preview 外部效果未确认，已停止后续 patch",
+            )
+        if presentation_id in self._live_disabled:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot preview 已关闭",
+            )
+        recipient = self._presentation_recipients.get(presentation_id)
+        text = _tail_text(self._reply_buffers.get(presentation_id, "").strip(), _REPLY_LIVE_TAIL)
+        if recipient is None or not text:
+            return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+        now = asyncio.get_running_loop().time()
+        previous = self._live_last_lengths.get(presentation_id, 0)
+        if (
+            now < self._live_next_at.get(presentation_id, 0.0)
+            and len(text) - previous < _LIVE_STREAM_MIN_CHARS
+        ):
+            return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+        self._live_next_at[presentation_id] = now + _LIVE_STREAM_MIN_INTERVAL_S
+        self._live_last_lengths[presentation_id] = len(text)
+        return await self._send_preview(presentation_id, recipient, text)
 
-    async def send(self, chat_id: str, message: str) -> None:
-        kind, target = self._parse_chat_id(chat_id)
-        if kind != "c2c":
-            raise ValueError("当前 QQBotChannel 仅支持私聊 c2c")
-        token = await self._get_access_token()
-        body = self._build_message_body(message)
-        _ = await self._api_request("POST", f"/v2/users/{target}/messages", body, token)
-
-    async def send_stream(self, chat_id: str, message: str) -> None:
-        kind, target = self._parse_chat_id(chat_id)
-        if kind != "c2c":
-            raise ValueError("当前 QQBotChannel 仅支持私聊 c2c")
-        msg_id = self._last_c2c_msg_id.get(target)
-        if not msg_id:
-            await self.send(chat_id, message)
-            return
-        try:
-            await self._send_stream_c2c(target, msg_id, message)
-        except Exception as e:
-            logger.warning("[qqbot] 私聊流式发送失败，回退普通发送: %s", e)
-            await self.send(chat_id, message)
-
-    async def _deliver_message(self, message: ChannelMessage) -> DeliveryReceipt:
-        """提交 QQBot 文本消息，并明确拒绝未支持的附件。"""
-
-        async def unsupported_file(
-            _chat_id: str,
-            _path: str,
-            _name: str | None,
-        ) -> None:
-            raise RuntimeError("官方 QQBot 当前不支持发送文件")
-
-        async def unsupported_image(_chat_id: str, _path: str) -> None:
-            raise RuntimeError("官方 QQBot 当前不支持发送图片")
-
-        return await deliver_message_parts(
-            message,
-            send_text=self.send_proactive,
-            send_file=unsupported_file,
-            send_image=unsupported_image,
-        )
-
-    async def _send_stream_c2c(self, openid: str, msg_id: str, message: str) -> None:
-        token = await self._get_access_token()
-        msg_seq = self._next_msg_seq()
-        stream_msg_id = ""
-        chunks = list(_iter_stream_chunks(message))
-        if not chunks:
-            chunks = [""]
-        for index, content in enumerate(chunks):
-            is_last = index == len(chunks) - 1
+    async def _send_preview(
+        self,
+        presentation_id: str,
+        recipient: str,
+        text: str,
+    ) -> PresentationReceipt:
+        if presentation_id in self._live_uncertain:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.UNKNOWN,
+                error="QQBot preview 外部效果未确认，已停止后续 patch",
+            )
+        if presentation_id in self._live_disabled:
+            return PresentationReceipt(
+                presentation_id,
+                DeliveryStatus.REJECTED,
+                error="QQBot preview 已关闭",
+            )
+        _, openid = _parse_recipient(recipient)
+        state = self._live_states.get(presentation_id)
+        if state is None:
+            message_id = self._presentation_message_ids.get(presentation_id)
+            if message_id is None:
+                raise RuntimeError(
+                    f"QQBot preview 缺少 provider message id: {presentation_id}"
+                )
+            state = _LiveStreamState(
+                openid,
+                _provider_segment(message_id, "QQBot message_id"),
+                _next_msg_seq(),
+            )
+            self._live_states[presentation_id] = state
+        lock = self._live_locks.setdefault(presentation_id, asyncio.Lock())
+        async with lock:
+            error: str | None = None
             body: dict[str, Any] = {
                 "input_mode": "replace",
-                "input_state": 10 if is_last else 1,
+                "input_state": 1,
                 "content_type": "markdown",
-                "content_raw": content,
-                "event_id": msg_id,
-                "msg_id": msg_id,
-                "msg_seq": msg_seq,
-                "index": index,
+                "content_raw": text,
+                "event_id": state.msg_id,
+                "msg_id": state.msg_id,
+                "msg_seq": state.msg_seq,
+                "index": state.index,
             }
-            if stream_msg_id:
-                body["stream_msg_id"] = stream_msg_id
-            result = await self._api_request(
-                "POST",
-                f"/v2/users/{openid}/stream_messages",
-                body,
-                token,
-            )
-            stream_msg_id = str(result.get("id") or stream_msg_id)
-
-    async def _on_turn_started(self, event: TurnStarted) -> None:
-        if event.channel != _CHANNEL:
-            return
-        await self._cancel_live_tasks(event.session_key)
-        self._clear_live_session(event.session_key)
-
-    async def _on_stream_delta(self, event: StreamDeltaReady) -> None:
-        if event.channel != _CHANNEL:
-            return
-        if not event.content_delta:
-            return
-        reply = self._reply_buffers.get(event.session_key, "")
-        self._reply_buffers[event.session_key] = reply + event.content_delta
-        live_len = len(self._reply_buffers.get(event.session_key, ""))
-        last_len = self._live_last_lengths.get(event.session_key, 0)
-        now = asyncio.get_running_loop().time()
-        next_at = self._live_next_at.get(event.session_key, 0.0)
-        if now < next_at and live_len - last_len < _LIVE_STREAM_MIN_CHARS:
-            return
-        self._live_next_at[event.session_key] = now + _LIVE_STREAM_MIN_INTERVAL_S
-        self._live_last_lengths[event.session_key] = live_len
-        self._start_live_task(
-            event.session_key,
-            self._sync_live_message(event.session_key, event.chat_id),
-        )
-
-    async def _sync_live_message(
-        self,
-        session_key: str,
-        chat_id: str,
-    ) -> None:
-        text = _format_turn_live(self._reply_buffers.get(session_key, ""))
-        if text:
-            _ = await self._send_live_stream(session_key, chat_id, text, terminal=False)
-
-    async def _delete_live_preview(
-        self,
-        session_key: str,
-    ) -> None:
-        state = self._live_states.get(session_key)
-        if state is None or not state.stream_msg_id:
-            return
-        try:
-            await self._delete_message(
-                state.openid,
-                state.stream_msg_id,
-            )
-        except Exception as e:
-            logger.debug("[qqbot] 临时流式消息撤回失败，忽略: %s", e)
-
-    async def _send_live_stream(
-        self,
-        session_key: str,
-        chat_id: str,
-        text: str,
-        *,
-        terminal: bool,
-    ) -> bool:
-        if session_key in self._live_disabled:
-            return False
-        kind, openid = self._parse_chat_id(chat_id)
-        if kind != "c2c":
-            return False
-        msg_id = self._last_c2c_msg_id.get(openid)
-        if not msg_id:
-            return False
-        lock = self._live_locks.setdefault(session_key, asyncio.Lock())
-        async with lock:
-            if session_key in self._live_disabled:
-                return False
-            state = self._live_states.get(session_key)
-            if state is None:
-                state = _LiveStreamState(
-                    openid=openid,
-                    msg_id=msg_id,
-                    msg_seq=self._next_msg_seq(),
-                )
-                self._live_states[session_key] = state
-            if state.completed:
-                return False
+            if state.stream_msg_id:
+                body["stream_msg_id"] = state.stream_msg_id
             try:
-                token = await self._get_access_token()
-                body: dict[str, Any] = {
-                    "input_mode": "replace",
-                    "input_state": 10 if terminal else 1,
-                    "content_type": "markdown",
-                    "content_raw": text,
-                    "event_id": state.msg_id,
-                    "msg_id": state.msg_id,
-                    "msg_seq": state.msg_seq,
-                    "index": state.index,
-                }
-                if state.stream_msg_id:
-                    body["stream_msg_id"] = state.stream_msg_id
-                result = await self._api_request(
+                status, payload, error = await self._request_with_status(
                     "POST",
-                    f"/v2/users/{state.openid}/stream_messages",
+                    f"/v2/users/{openid}/stream_messages",
                     body,
-                    token,
                 )
-            except Exception as e:
-                failures = self._live_failures.get(session_key, 0) + 1
-                self._live_failures[session_key] = failures
-                status_code = _http_status_code(e)
-                if (status_code is not None and status_code != 429) or failures >= _LIVE_MAX_FAILURES:
-                    self._live_disabled.add(session_key)
-                logger.warning(
-                    "[qqbot] 临时流式刷新失败，跳过本帧 session=%s failures=%d disabled=%s err=%s",
-                    session_key,
-                    failures,
-                    session_key in self._live_disabled,
-                    e,
-                )
-                return False
-            self._live_failures[session_key] = 0
-            state.stream_msg_id = str(result.get("id") or state.stream_msg_id)
-            state.index += 1
-            state.completed = terminal
-            return True
-
-    def _start_live_task(
-        self,
-        session_key: str,
-        coro: Coroutine[Any, Any, None],
-    ) -> None:
-        task = asyncio.create_task(coro)
-        self._live_tasks.add(task)
-        self._live_tasks_by_session.setdefault(session_key, set()).add(task)
-        task.add_done_callback(lambda done: self._on_live_task_done(session_key, done))
-
-    def _on_live_task_done(self, session_key: str, task: asyncio.Task[None]) -> None:
-        self._live_tasks.discard(task)
-        tasks = self._live_tasks_by_session.get(session_key)
-        if tasks is not None:
-            tasks.discard(task)
-            if not tasks:
-                _ = self._live_tasks_by_session.pop(session_key, None)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.debug("[qqbot] 临时流式状态刷新失败: %s", exc)
-
-    async def _cancel_live_tasks(self, session_key: str) -> None:
-        tasks = list(self._live_tasks_by_session.get(session_key, set()))
-        for task in tasks:
-            _ = task.cancel()
-        if tasks:
-            _ = await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _drain_live_tasks(self) -> None:
-        tasks = [task for task in self._live_tasks if not task.done()]
-        if tasks:
-            _ = await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _clear_live_session(self, session_key: str) -> None:
-        _ = self._live_states.pop(session_key, None)
-        _ = self._reply_buffers.pop(session_key, None)
-        _ = self._live_next_at.pop(session_key, None)
-        _ = self._live_last_lengths.pop(session_key, None)
-        _ = self._live_failures.pop(session_key, None)
-        self._live_disabled.discard(session_key)
-        _ = self._live_locks.pop(session_key, None)
-
-    async def _send_input_notify(self, openid: str, msg_id: str) -> None:
-        try:
-            token = await self._get_access_token()
-            _ = await self._api_request(
-                "POST",
-                f"/v2/users/{openid}/messages",
-                {
-                    "msg_type": 6,
-                    "input_notify": {"input_type": 1, "input_second": 60},
-                    "msg_seq": self._next_msg_seq(),
-                    "msg_id": msg_id,
-                },
-                token,
+            except asyncio.CancelledError:
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+                raise
+            if status is DeliveryStatus.DELIVERED:
+                remote_id = payload.get("id")
+                if isinstance(remote_id, str) and remote_id.strip():
+                    try:
+                        state.stream_msg_id = _provider_segment(
+                            remote_id.strip(), "QQBot stream_message_id"
+                        )
+                    except ValueError as validation_error:
+                        status = DeliveryStatus.UNKNOWN
+                        error = str(validation_error)
+                        self._live_uncertain.add(presentation_id)
+                        self._live_disabled.add(presentation_id)
+                        remote_id = None
+                    if remote_id is not None:
+                        state.index += 1
+                        self._live_failures[presentation_id] = 0
+                        self._live_uncertain.discard(presentation_id)
+                else:
+                    status = DeliveryStatus.UNKNOWN
+                    error = (
+                        "QQBot preview 2xx response 缺少 stream message id，"
+                        "外部效果未确认"
+                    )
+                    self._live_uncertain.add(presentation_id)
+            if status is DeliveryStatus.UNKNOWN:
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+            elif status is DeliveryStatus.REJECTED:
+                self._live_disabled.add(presentation_id)
+            if status is not DeliveryStatus.DELIVERED:
+                failures = self._live_failures.get(presentation_id, 0) + 1
+                self._live_failures[presentation_id] = failures
+            return PresentationReceipt(
+                presentation_id,
+                status,
+                (state.stream_msg_id,) if state.stream_msg_id else (),
+                error,
             )
-        except Exception as e:
-            logger.debug("[qqbot] 发送输入中提示失败: %s", e)
 
-    async def _delete_message(self, openid: str, message_id: str) -> None:
-        token = await self._get_access_token()
-        _ = await self._api_request(
-            "DELETE",
-            f"/v2/users/{openid}/messages/{message_id}",
-            token=token,
+    async def _finish_preview(self, presentation_id: str) -> PresentationReceipt:
+        state = self._live_states.get(presentation_id)
+        clear_state = True
+        try:
+            if presentation_id in self._live_uncertain:
+                clear_state = False
+                return PresentationReceipt(
+                    presentation_id,
+                    DeliveryStatus.UNKNOWN,
+                    error="QQBot preview 外部效果未确认，保留本地失败状态",
+                )
+            if presentation_id in self._live_disabled and (
+                state is None or not state.stream_msg_id
+            ):
+                return PresentationReceipt(
+                    presentation_id,
+                    DeliveryStatus.REJECTED,
+                    error="QQBot preview 已拒绝，未产生可清理的远端消息",
+                )
+            if state is None:
+                return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+            if not state.stream_msg_id:
+                return PresentationReceipt(presentation_id, DeliveryStatus.DELIVERED)
+            _provider_segment(state.openid, "QQBot user_openid")
+            _provider_segment(state.stream_msg_id, "QQBot stream_message_id")
+            try:
+                status, _payload, error = await self._request_with_status(
+                    "DELETE",
+                    f"/v2/users/{state.openid}/messages/{state.stream_msg_id}",
+                )
+            except asyncio.CancelledError:
+                clear_state = False
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+                raise
+            if status is DeliveryStatus.UNKNOWN:
+                clear_state = False
+                self._live_uncertain.add(presentation_id)
+                self._live_disabled.add(presentation_id)
+            return PresentationReceipt(
+                presentation_id,
+                status,
+                (state.stream_msg_id,),
+                error,
+            )
+        finally:
+            if clear_state:
+                self._clear_presentation(presentation_id)
+
+    async def _send_input_notify(
+        self,
+        recipient: str,
+        message_id: str,
+    ) -> tuple[DeliveryStatus, str | None, str | None]:
+        _, openid = _parse_recipient(recipient)
+        _provider_segment(message_id, "QQBot message_id")
+        status, payload, error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/messages",
+            {
+                "msg_type": 6,
+                "input_notify": {"input_type": 1, "input_second": 60},
+                "msg_seq": _next_msg_seq(),
+                "msg_id": message_id,
+            },
         )
+        provider_id = str(payload.get("id") or "").strip() or None
+        if provider_id is not None:
+            try:
+                _provider_segment(provider_id, "QQBot message_id")
+            except ValueError as error:
+                return DeliveryStatus.UNKNOWN, None, str(error)
+        return status, provider_id, error
 
-    def _build_message_body(self, message: str) -> dict[str, Any]:
-        return {
-            "markdown": {"content": message},
-            "msg_type": 2,
-            "msg_seq": self._next_msg_seq(),
-        }
+    async def _send_text(
+        self,
+        recipient: str,
+        message: str,
+    ) -> tuple[DeliveryStatus, str | None, str | None]:
+        _, openid = _parse_recipient(recipient)
+        status, payload, error = await self._request_with_status(
+            "POST",
+            f"/v2/users/{openid}/messages",
+            {
+                "markdown": {"content": message},
+                "msg_type": 2,
+                "msg_seq": _next_msg_seq(),
+            },
+        )
+        provider_id = str(payload.get("id") or "").strip() or None
+        if status is DeliveryStatus.DELIVERED and provider_id is None:
+            return DeliveryStatus.UNKNOWN, None, "QQBot response 缺少 message id"
+        if provider_id is not None:
+            try:
+                _provider_segment(provider_id, "QQBot message_id")
+            except ValueError as error:
+                return DeliveryStatus.UNKNOWN, None, str(error)
+        return status, provider_id, error
 
-    def _next_msg_seq(self) -> int:
-        return int(time.time() * 1000) % 65536
-
-    def _parse_chat_id(self, chat_id: str) -> tuple[str, str]:
-        value = chat_id.strip()
-        if value.startswith("qqbot:"):
-            value = value[len("qqbot:"):]
-        if ":" not in value:
-            return "c2c", value
-        kind, target = value.split(":", 1)
-        if kind not in {"c2c", "group"} or not target:
-            raise ValueError(f"无效的 QQBot chat_id: {chat_id!r}")
-        return kind, target
+    async def _request_with_status(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[DeliveryStatus, dict[str, Any], str | None]:
+        try:
+            payload = await self._api_request(method, path, body)
+        except asyncio.CancelledError:
+            return DeliveryStatus.UNKNOWN, {}, "QQBot provider request 被取消，效果未知"
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            delivery = (
+                DeliveryStatus.REJECTED
+                if status in _REJECTED_HTTP_STATUSES
+                else DeliveryStatus.UNKNOWN
+            )
+            return delivery, {}, f"HTTP {status}"
+        except httpx.RequestError as error:
+            delivery = (
+                DeliveryStatus.REJECTED
+                if _is_pre_effect_request_error(error)
+                else DeliveryStatus.UNKNOWN
+            )
+            return delivery, {}, str(error) or type(error).__name__
+        except Exception as error:
+            return DeliveryStatus.UNKNOWN, {}, str(error) or type(error).__name__
+        return DeliveryStatus.DELIVERED, payload, None
 
     async def _get_access_token(self) -> str:
         now = time.time()
-        if self._token and now < self._token.expires_at - 300:
+        if self._token is not None and now < self._token.expires_at - 300:
             return self._token.token
-        resp = await self._client.post(
+        client = self._require_client()
+        provider = self._provider_client
+        if provider is None:
+            raise RuntimeError("QQBot provider client 尚未创建")
+        app_id = provider.credential(self._credential_ref("app_id"))
+        client_secret = provider.credential(self._credential_ref("client_secret"))
+        response = await client.post(
             _TOKEN_URL,
-            json={"appId": self._app_id, "clientSecret": self._client_secret},
+            json={"appId": app_id, "clientSecret": client_secret},
         )
-        _ = resp.raise_for_status()
-        data = resp.json()
+        response.raise_for_status()
+        data = response.json()
         token = str(data["access_token"])
-        expires_in = int(data.get("expires_in") or 7200)
-        self._token = _TokenCache(token=token, expires_at=now + expires_in)
+        self._token = _TokenCache(token, now + int(data.get("expires_in") or 7200))
         return token
 
     async def _api_request(
@@ -592,36 +1084,247 @@ class QQBotChannel:
         }
         if body is not None:
             kwargs["json"] = body
-        resp = await self._client.request(method, f"{_API_BASE}{path}", **kwargs)
-        _ = resp.raise_for_status()
-        if not resp.content:
+        response = await self._require_client().request(
+            method,
+            f"{_API_BASE}{path}",
+            **kwargs,
+        )
+        response.raise_for_status()
+        if not response.content:
             return {}
-        data = resp.json()
-        return cast(dict[str, Any], data) if isinstance(data, dict) else {}
+        payload = response.json()
+        return cast(dict[str, Any], payload) if isinstance(payload, dict) else {}
+
+    def _credential_ref(self, name: str) -> CredentialRef:
+        matches = [
+            ref
+            for path, ref in self._credentials.items()
+            if path in _CREDENTIAL_ALIASES[name]
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"QQBot credential {name} 必须恰好有一个 physical alias"
+            )
+        return matches[0]
+
+    def _require_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            raise RuntimeError("QQBot adapter 尚未 start")
+        return self._client
+
+    def _require_presentation(self) -> ChannelPresentationPorts:
+        if self._presentation is None:
+            raise RuntimeError("QQBot presentation ports 未绑定")
+        return self._presentation
+
+    def _cleanup_failure(self, resource: str, error: BaseException) -> ChannelCleanupFailure:
+        return ChannelCleanupFailure(
+            stage="channel-stop",
+            plugin_id=_CHANNEL,
+            generation_id=self._context.generation_id,
+            binding_token=self._binding_token,
+            resource=resource,
+            error_type=type(error).__name__,
+            message=str(error) or type(error).__name__,
+            retry_action="retry_generation_cleanup",
+        )
+
+    def _clear_presentation(self, presentation_id: str) -> None:
+        self._presentation_recipients.pop(presentation_id, None)
+        self._presentation_message_ids.pop(presentation_id, None)
+        self._reply_buffers.pop(presentation_id, None)
+        self._live_states.pop(presentation_id, None)
+        self._live_next_at.pop(presentation_id, None)
+        self._live_last_lengths.pop(presentation_id, None)
+        self._live_failures.pop(presentation_id, None)
+        self._live_disabled.discard(presentation_id)
+        self._live_uncertain.discard(presentation_id)
+        self._live_locks.pop(presentation_id, None)
+
+    def _clear_presentations(self) -> None:
+        for presentation_id in tuple(self._presentation_recipients):
+            self._clear_presentation(presentation_id)
+        self._message_recipients.clear()
+        self._message_identities.clear()
 
 
-def _as_dict(value: object) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
+    aliases = [config[key] for key in ("allow_from", "allowFrom") if key in config]
+    if len(aliases) > 1 and aliases[0] != aliases[1]:
+        raise RuntimeError("QQBot allow_from/allowFrom 声明冲突")
+    value = aliases[0] if aliases else ()
+    if not isinstance(value, tuple) or any(not isinstance(item, str) for item in value):
+        raise TypeError("QQBot allow_from 必须是字符串 tuple")
+    return frozenset(item for item in value if item)
 
 
-def _http_status_code(err: Exception) -> int | None:
-    if isinstance(err, httpx.HTTPStatusError):
-        return err.response.status_code
-    return None
+def _provider_attachments(data: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """Normalize QQ provider attachment objects without retaining provider paths."""
+
+    raw = data.get("attachments")
+    if raw is None:
+        aliases: list[Mapping[str, Any]] = []
+        for key in ("image", "file", "media"):
+            value = data.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if not isinstance(value, Mapping):
+                return None
+            aliases.append(value)
+        return aliases
+    if not isinstance(raw, list):
+        return None
+    result: list[Mapping[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return None
+        result.append(item)
+    return result
 
 
-def _iter_stream_chunks(text: str, limit: int = 160) -> list[str]:
-    chunks: list[str] = []
-    for end in range(limit, len(text) + limit, limit):
-        chunks.append(text[:end])
-    return chunks
+def _has_provider_attachments(data: Mapping[str, Any]) -> bool:
+    """Return whether a provider payload carries a non-empty attachment list."""
+
+    attachments = _provider_attachments(data)
+    return attachments is None or bool(attachments)
 
 
-def _format_turn_live(reply: str) -> str:
-    return _tail_text(reply.strip(), _REPLY_LIVE_TAIL)
+def _provider_segment(value: object, field_name: str) -> str:
+    """Validate an opaque QQ provider value before putting it in a URL path."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} 不能为空")
+    if value != value.strip():
+        raise ValueError(f"{field_name} 不能包含首尾空白")
+    if len(value) > _MAX_PROVIDER_SEGMENT_LENGTH:
+        raise ValueError(f"{field_name} 超过长度上限")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} 不能包含路径分隔符")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{field_name} 不能包含控制字符")
+    return value
+
+
+def _validate_media_url(value: object) -> str:
+    """Allow only HTTPS QQ media URLs without redirects or user-controlled hosts."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("QQBot 入站附件缺少安全下载 URL")
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in _QQ_MEDIA_HOSTS:
+        raise ValueError("QQBot 入站附件 URL 必须是受限 QQ HTTPS 媒体域名")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("QQBot 入站附件 URL 禁止 userinfo")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("QQBot 入站附件 URL 端口非法") from error
+    if port not in (None, 443):
+        raise ValueError("QQBot 入站附件 URL 端口非法")
+    return value
+
+
+def _is_pre_effect_request_error(error: httpx.RequestError) -> bool:
+    """Classify only connection setup failures as deterministic no-effect errors."""
+
+    return isinstance(
+        error,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ProxyError,
+            httpx.UnsupportedProtocol,
+            httpx.InvalidURL,
+        ),
+    )
+
+
+def _parse_recipient(recipient: str) -> tuple[str, str]:
+    _provider_segment(recipient, "QQBot recipient")
+    value = recipient
+    if value.startswith("qqbot:"):
+        value = value[len("qqbot:") :]
+    if not value:
+        raise ValueError(f"无效的 QQBot recipient: {recipient!r}")
+    if ":" not in value:
+        return "c2c", _provider_segment(value, "QQBot user_openid")
+    kind, target = value.split(":", 1)
+    if kind != "c2c" or not target:
+        raise ValueError(f"无效的 QQBot recipient: {recipient!r}")
+    return kind, _provider_segment(target, "QQBot user_openid")
+
+
+def _next_msg_seq() -> int:
+    return int(time.time() * 1000) % 65536
 
 
 def _tail_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return "..." + text[-(limit - 3):]
+    return "..." + text[-(limit - 3) :]
+
+
+async def _close_attachment_lease(lease: Any) -> None:
+    """Finish attachment lease cleanup even when the caller is cancelled."""
+
+    task = asyncio.create_task(lease.aclose(), name="qqbot-attachment-lease-close")
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    if task.cancelled():
+        raise asyncio.CancelledError
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _bounded_response_bytes(response: Any, *, max_bytes: int) -> bytes:
+    """Collect a provider response without exceeding the attachment memory bound."""
+
+    if max_bytes <= 0 or max_bytes > _MAX_ATTACHMENT_BYTES:
+        raise ValueError("QQBot 入站附件读取额度非法")
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw_length = headers.get("content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except (TypeError, ValueError) as error:
+                raise ValueError("QQBot provider Content-Length 非法") from error
+            if content_length < 0 or content_length > max_bytes:
+                raise ValueError("QQBot 入站附件超过剩余批次额度")
+    chunks: list[bytes] = []
+    total = 0
+    aiter_bytes = getattr(response, "aiter_bytes", None)
+    if not callable(aiter_bytes):
+        raise TypeError("QQBot provider response 必须提供 aiter_bytes")
+    aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
+    async for chunk in aiter_bytes():
+        if not isinstance(chunk, bytes):
+            raise TypeError("QQBot provider response chunk 必须是 bytes")
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("QQBot 入站附件超过剩余批次额度")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
+    """Finish critical cleanup before restoring caller cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result

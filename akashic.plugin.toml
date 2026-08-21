@@ -1,0 +1,8 @@
+schema_version = 1
+name = "qqbot"
+version = "3.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+
+[channel_credentials]
+qqbot = ["appId", "app_id", "clientSecret", "client_secret"]
