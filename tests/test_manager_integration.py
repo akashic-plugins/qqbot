@@ -17,6 +17,15 @@ from bus.event_bus import EventBus
 ROOT = Path(__file__).parents[1]
 
 
+def _current_channel_generation(
+    manager: PluginManager,
+) -> channel_generation_host.ChannelGeneration | None:
+    snapshot = manager.current_snapshot
+    if snapshot is None:
+        return None
+    return manager.channel_generation_host.get(snapshot.snapshot_id)
+
+
 class FakeProviderClient:
     def __init__(self) -> None:
         self.closed = 0
@@ -111,7 +120,7 @@ async def test_manager_formal_candidate_discard_promote_and_cleanup(
     # 2. Formal boot owns one provider; candidate stays inert and secret-free.
     await manager.load_all()
     stable = manager.current_snapshot
-    runtime = manager.active_channel_generation
+    runtime = _current_channel_generation(manager)
     assert stable is not None and stable.state == "committed"
     assert runtime is not None and runtime.channel("qqbot").admission_open
     assert factory.create_calls == 1
@@ -139,10 +148,10 @@ async def test_manager_formal_candidate_discard_promote_and_cleanup(
     assert publication["publication_state"] == "committed"
     assert manager.current_snapshot is not stable
     assert factory.create_calls == 2
-    assert manager.active_channel_generation is not None
-    assert manager.active_channel_generation.channel("qqbot").admission_open
+    runtime = _current_channel_generation(manager)
+    assert runtime is not None and runtime.channel("qqbot").admission_open
 
     await manager.terminate_all()
-    assert manager.active_channel_generation is None
+    assert _current_channel_generation(manager) is None
     assert factory.close_calls == 2
     assert factory.client.closed == 2
